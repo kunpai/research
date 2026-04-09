@@ -1,8 +1,10 @@
-# Deep Research with LiteLLM
+# H.A.S.H.I.L. (Heuristic Analysis & Synthesis for Highly Incoherent Literature)
+
+![HASHIL Logo](hashil.png)
 
 Local-first research pipeline that runs topic clarification, multi-round retrieval, chunked reading, citation resolution, collaborative synthesis, and LaTeX/PDF report generation.
 
-The code is no longer Ollama-only. Model calls go through LiteLLM, so the same pipeline can run on local Ollama or remote providers such as Gemini, OpenAI, Anthropic, OpenRouter, NVIDIA NIM, Groq, Together, DeepInfra, Mistral, and others.
+Model calls go through LiteLLM, so the same pipeline can run on local Ollama or remote providers such as Gemini, OpenAI, Anthropic, OpenRouter, NVIDIA NIM, Groq, Together, DeepInfra, Mistral, and others.
 
 ## What The Code Actually Does
 
