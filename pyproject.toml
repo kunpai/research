@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-research-ollama"
+version = "0.1.0"
+description = "Deep research CLI with Ollama, web/paper search, BibTeX resolution, and LaTeX output."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pypdf>=4.2.0",
+]
+
+[project.scripts]
+deep-research = "deep_research_ollama.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
