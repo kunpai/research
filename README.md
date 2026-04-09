@@ -1,166 +1,283 @@
 # Deep Research with LiteLLM
 
-Local-first deep research pipeline built around LiteLLM, paper/web search, BibTeX resolution, and LaTeX report generation.
+Local-first research pipeline that runs topic clarification, multi-round retrieval, chunked reading, citation resolution, collaborative synthesis, and LaTeX/PDF report generation.
 
-It asks clarifying questions, rewrites the topic into a tighter research brief, searches across multiple backends, reads large sources in chunks, resolves citations, keeps a persistent research constitution, and emits report artifacts you can inspect or edit.
+The code is no longer Ollama-only. Model calls go through LiteLLM, so the same pipeline can run on local Ollama or remote providers such as Gemini, OpenAI, Anthropic, OpenRouter, NVIDIA NIM, Groq, Together, DeepInfra, Mistral, and others.
 
-## Current Status
+## What The Code Actually Does
 
-The system is in a solid prototype state:
+- asks clarifying questions unless you skip them
+- rewrites the topic into a research brief with `queries`, `must_cover`, `focus_areas`, and related topics
+- builds a retrieval strategy with anchor phrases, concept groups, and generic-term penalties
+- searches multiple backends over multiple rounds
+- deduplicates and promotes paper landing pages into canonical paper records when possible
+- scores results with static heuristics, then runs a critic pass that gives a yes/no relevance judgment from query + title + abstract/snippet
+- selects a diverse final set of sources
+- fetches HTML/PDF/arXiv content and reads long sources in chunks
+- resolves citations into BibTeX
+- runs a collaborative synthesis loop with evidence, skeptic, gap, and chair roles
+- writes `report.tex`, `references.bib`, `retrieval.json`, `run.json`, `constitution.json`, `constitution.bib`, and usually `report.pdf`
+- checkpoints aggressively and resumes incomplete runs from the same output directory
 
-- Structured outputs are schema-driven per stage.
-- Model routing is provider-agnostic through LiteLLM.
-- Retrieval is now a hybrid of LLM-guided strategy plus static ranking and coverage heuristics.
-- Large papers are chunked and summarized incrementally.
-- The system keeps persistent research memory in `constitution.json` and `constitution.bib`.
-- Source synthesis now includes a collaborative worker debate before final writing.
-- Broad or ambiguous topics are much better than before, but still weaker than narrow technical topics.
+Important constraint: the "multi-agent" behavior is collaborative role prompting inside one pipeline. It is not true multi-process or multi-GPU parallel execution yet.
 
-One important detail: the "agents" are collaborative worker roles with message passing, not true GPU-parallel execution. They behave like a debate loop inside one pipeline.
+## Status
 
-## System Diagram
+Current state is a strong prototype:
+
+- provider/model routing is LiteLLM-based
+- structured outputs are schema-driven per stage
+- retrieval is hybrid: strategy generation + static ranking + critic filtering
+- constitution state is persistent and now tracks metadata such as resume counts and confidence summaries
+- the GUI can launch, stop, resume, inspect artifacts, render PDFs, and expose the main retrieval-budget knobs
+- LaTeX compilation prefers Unicode-friendly engines and surfaces real TeX failure details
+
+Still true:
+
+- broad topics are weaker than narrow technical topics
+- Google Scholar is not integrated directly
+- worker roles are sequential, not real parallel workers
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    U["User / CLI"] --> C["Clarifier\nask_clarifying_questions"]
-    C --> P["Planner\nbuild_plan"]
-    P --> RS["Retrieval Strategy\nLLM schema + heuristic fallback"]
-    RS --> R["Retriever\nmulti-round search"]
-    R --> SEL["Static Selector\ncoverage + diversity + penalties"]
-    SEL --> F["Fetcher\nHTML / PDF / arXiv"]
-    F --> SUM["Reader\nchunk summaries + merge"]
-    SUM --> CIT["Citation Resolver\nCrossref / arXiv / web BibTeX"]
-    CIT --> COLLAB["Collaborative Workers\nEvidence / Skeptic / Gap / Chair"]
-    COLLAB --> W["Writer\nLaTeX sections + findings"]
-    W --> CONS["Constitution Store\nnotes / findings / citations"]
-    CONS --> OUT["Artifacts\nreport.tex\nreferences.bib\nretrieval.json\nrun.json"]
+    U["User"] --> CLI["CLI / GUI"]
+    CLI --> P["ResearchPipeline.run()"]
+    P --> C["Clarifier"]
+    C --> B["Planner"]
+    B --> RS["Retrieval Strategy"]
+    RS --> R["Retriever"]
+    R --> RK["Static Ranker"]
+    RK --> CR["Relevance Critic"]
+    CR --> SEL["Diverse Source Selector"]
+    SEL --> F["Fetcher / Chunker"]
+    F --> S["Chunk Summaries"]
+    S --> CIT["Citation Resolver"]
+    CIT --> COL["Collaborative Synthesis Roles"]
+    COL --> W["Writer"]
+    W --> CONS["Constitution Store"]
+    W --> OUT["Artifacts"]
 
-    subgraph Search Backends
+    subgraph "Search Backends"
         AX["arXiv"]
         SS["Semantic Scholar"]
-        CR["Crossref"]
+        CF["Crossref"]
         GC["Google CSE"]
-        SP["SerpAPI"]
+        SA["SerpAPI"]
         DDG["DuckDuckGo HTML"]
     end
 
     R --> AX
     R --> SS
-    R --> CR
+    R --> CF
     R --> GC
-    R --> SP
+    R --> SA
     R --> DDG
 ```
 
-## Workflow Diagram
+## End-to-End Workflow
 
 ```mermaid
 flowchart TD
-    A["Start: deep-research run <topic>"] --> B["Load constitution + research program"]
+    A["Start run"] --> B["Load constitution + research_program.md"]
     B --> C{"Clarify?"}
     C -->|yes| D["Generate clarifying questions"]
-    C -->|no| E["Use provided answers"]
+    C -->|no| E["Use given answers"]
     D --> E
-    E --> F["Build research plan\nqueries + rewritten question + must-cover"]
-    F --> G["Build retrieval strategy\nanchor phrases + concept groups + generic terms"]
-    G --> H["Search round 1..N"]
-    H --> I["Deduplicate + promote paper landing pages"]
-    I --> J["Score results\npapers, overlap, query hits, coverage, penalties"]
-    J --> K["Expand queries from top results"]
-    K --> L{"More rounds?"}
-    L -->|yes| H
-    L -->|no| M["Select diverse final sources"]
+    E --> F["Build plan"]
+    F --> G["Build retrieval strategy"]
+    G --> H["Run search rounds"]
+    H --> I["Promote / normalize / dedupe"]
+    I --> J["Static score + coverage heuristics"]
+    J --> K["Critic yes/no relevance pass"]
+    K --> L["Select final sources"]
+    L --> M["Checkpoint run.json + retrieval.json + references.bib"]
     M --> N["Fetch documents"]
-    N --> O{"Large source?"}
-    O -->|yes| P["Chunk text / PDF"]
-    O -->|no| Q["Single chunk"]
-    P --> R["Summarize chunks"]
-    Q --> R
-    R --> S["Resolve BibTeX"]
-    S --> T["Collaborative worker debate"]
-    T --> U["Synthesize report"]
-    U --> V["Update constitution"]
-    V --> W["Write report.tex / references.bib / retrieval.json / run.json"]
+    N --> O["Chunk long sources"]
+    O --> P["Summarize chunks"]
+    P --> Q["Resolve citations"]
+    Q --> R["Collaborative role debate"]
+    R --> S["Synthesize report"]
+    S --> T["Update constitution"]
+    T --> U["Write report.tex / references.bib"]
+    U --> V["Compile report.pdf if TeX tools exist"]
 ```
 
-## Retrieval Loop
+## Retrieval And Selection
 
-```mermaid
-flowchart TD
-    A["Seed queries from topic + plan"] --> B["Search all enabled backends"]
-    B --> C["Normalize records"]
-    C --> D["Promote web results into paper records\nDOI / arXiv / publisher title lookup"]
-    D --> E["Deduplicate across DOI / arXiv / title"]
-    E --> F["Static score"]
-    F --> F1["Signals:\npaper kind\nbackend quality\nquery hits\nanchor overlap\nconcept-group coverage\ncitation count"]
-    F --> F2["Penalties:\ngeneric repo/blog pages\nthin Crossref records\nweak web-only overlap"]
-    F1 --> G["Ranked pool"]
-    F2 --> G
-    G --> H["Generate expansion queries from top-ranked evidence"]
-    H --> I["Repeat until budget exhausted"]
-    I --> J["Greedy final selection\ncoverage + backend diversity + paper/web mix"]
-```
+The retrieval stack is not "let the model pick papers."
 
-## What It Does
+It does this:
 
-- Clarifies the task before research starts.
-- Routes model calls through LiteLLM, so you can swap providers like Ollama, Gemini, OpenAI, Anthropic, or OpenRouter.
-- Rewrites the request into a sharper research brief.
-- Generates topic-specific retrieval strategy with schema-constrained LLM output and heuristic fallback.
-- Searches `arXiv`, `Semantic Scholar`, `Crossref`, `Google CSE`, `SerpAPI`, or `DuckDuckGo HTML`.
-- Promotes likely paper landing pages into canonical paper records when possible.
-- Reads large PDFs and long documents in chunks.
-- Runs an internal worker debate over the gathered evidence before final writing.
-- Resolves DOI-backed BibTeX via Crossref when possible.
-- Falls back to arXiv or generated web BibTeX when needed.
-- Stores findings, notes, and citations in a persistent constitution.
-- Outputs LaTeX paragraphs plus a `.bib` file.
+- generates seed queries from the plan
+- expands queries over multiple rounds
+- deduplicates by DOI, arXiv id, and title similarity
+- promotes publisher landing pages into paper records when possible
+- statically scores for:
+  - paper kind
+  - backend quality
+  - query-hit count
+  - anchor phrase overlap
+  - concept-group coverage
+  - citation count
+- penalizes:
+  - generic repo/blog pages
+  - thin Crossref-only records
+  - weak web overlap
+- runs a critic pass on the shortlist using query + title + abstract/snippet
 
-## Main Components
+The critic is a retrieval filter. It does not write the report. It only helps demote tangential sources before fetch/summarization.
 
-- [`cli.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/cli.py)
-  Entry point and CLI commands.
-- [`pipeline.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/pipeline.py)
-  End-to-end orchestration: clarify, plan, retrieve, select, summarize, synthesize, write outputs.
-- [`tools.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/tools.py)
-  Search backends, dedupe, promotion, document fetching, chunking.
-- [`llm.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/llm.py)
-  LiteLLM-backed provider-agnostic client with schema validation and JSON fallback.
-- [`providers.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/providers.py)
-  Provider metadata, suggested models, and GUI/API-key environment wiring.
-- [`schemas.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/schemas.py)
-  JSON Schemas for each LLM stage.
-- [`citations.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/citations.py)
-  BibTeX and cite-key resolution.
-- [`constitution.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/constitution.py)
-  Persistent findings, notes, and citation store.
-- [`prompts.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/prompts.py)
-  Role prompts for clarifier, planner, retrieval strategy, reader, and writer.
-- [`program.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/program.py)
-  Run-level editable `research_program.md` support.
+## Collaborative Synthesis
+
+Before final writing, the pipeline runs four role prompts:
+
+- `EvidenceAgent`
+- `SkepticAgent`
+- `GapAgent`
+- `ChairAgent`
+
+These roles debate the gathered evidence and feed a collaboration snapshot into the final writer. This improves the final report, but it is still sequential orchestration inside one process.
+
+## Checkpointing, Resume, And Constitution
+
+Runs are resumable in the same output directory.
+
+What is persisted:
+
+- partial `run.json`
+- partial `retrieval.json`
+- partial `references.bib`
+- incremental source-note / citation state in the constitution
+
+The constitution is not just a dump of citations anymore. It now stores metadata such as:
+
+- `resume_count`
+- `resume_from_status`
+- `last_checkpoint_stage`
+- confidence summaries for citations, source notes, and findings
+- per-record lifecycle metadata like `created_at`, `updated_at`, `last_seen_at`, and `seen_count`
+
+Confidence is heuristic, not model-generated.
+
+## Providers And Models
+
+The provider layer lives in [`providers.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/providers.py).
+
+What it supports:
+
+- dynamic provider discovery from LiteLLM when available
+- curated metadata for common providers
+- suggested model lists for common providers
+- freeform provider/model entry in the GUI, so you are not blocked by the suggestion list
+
+Typical examples:
+
+- Ollama:
+  - provider: `ollama`
+  - model: `gemma4:e4b`
+- Gemini:
+  - provider: `gemini`
+  - model: `gemini-2.5-flash`
+- NVIDIA NIM:
+  - provider: `nvidia_nim`
+  - model: `qwen/qwen3.5-122b-a10b`
+  - api base: `https://integrate.api.nvidia.com/v1`
+
+The pipeline internally resolves `provider + model` into LiteLLM's `provider/model` format if needed.
+
+## GUI
+
+The GUI is implemented in [`gui.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/gui.py).
+
+It currently supports:
+
+- provider input with suggestions
+- model input with suggestions
+- API key input for remote providers
+- API base override
+- start / stop / resume
+- PDF rendering in the artifact viewer
+- live status from checkpoints
+- retrieval and summarization budget controls
+
+The main knobs exposed in the GUI are:
+
+- `Seed Queries`
+- `Total Queries`
+- `Search Rounds`
+- `Selected Sources`
+- `Web Results / Query`
+- `Paper Results / Query`
+- `Critic Shortlist`
+- `Chunks / Source`
+- `Summary Budget`
+
+The GUI does not persist API keys to run artifacts. They are passed only through the launched subprocess environment.
 
 ## Artifacts
 
-Each run writes:
+Each run can produce:
 
+- `research_program.md`
+  Editable per-run instruction surface.
 - `report.tex`
-  Final LaTeX report.
+  Generated LaTeX report.
 - `references.bib`
-  BibTeX entries for selected citations.
+  BibTeX for the selected citations.
+- `report.pdf`
+  Compiled PDF when TeX tools are available and compilation succeeds.
 - `retrieval.json`
-  Search rounds, issued queries, ranking trace, and selected sources.
+  Search rounds, ranking traces, query expansion, and selected sources.
 - `run.json`
-  Full run snapshot including plan, selected sources, documents, citations, and synthesis payload.
+  Full run snapshot, progress, checkpoints, and LaTeX status.
 - `constitution.json`
-  Persistent memory of notes, findings, and citations.
+  Persistent notes, findings, citations, and metadata/confidence summaries.
 - `constitution.bib`
   Persistent BibTeX memory.
-- `research_program.md`
-  Editable run-level instruction surface.
+- `gui_run.log`
+  GUI subprocess output.
 
-## Setup
+## LaTeX And PDF Generation
 
-1. Create a virtual environment and install the package.
+The report writer produces LaTeX source and then tries to compile a PDF.
+
+Current behavior:
+
+- prefers `latexmk`
+- prefers `lualatex`, then `xelatex`, then `pdflatex`
+- adds a more Unicode-tolerant preamble by default
+- sanitizes problematic text before writing
+- records the compile result in `run.json`
+- surfaces the real fatal TeX error when compilation fails
+
+If no TeX toolchain is installed, the run still succeeds at the research level and leaves `report.tex` plus `references.bib`.
+
+## Main Files
+
+- [`cli.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/cli.py)
+  CLI commands, provider/model overrides, and knob overrides.
+- [`config.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/config.py)
+  Settings defaults, env loading, and research budgets.
+- [`llm.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/llm.py)
+  LiteLLM-backed chat/JSON client with schema validation.
+- [`providers.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/providers.py)
+  Provider metadata, model suggestions, and env wiring.
+- [`pipeline.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/pipeline.py)
+  End-to-end orchestration.
+- [`tools.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/tools.py)
+  Search, dedupe, fetch, promotion, and chunking.
+- [`citations.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/citations.py)
+  BibTeX and cite-key resolution.
+- [`constitution.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/constitution.py)
+  Persistent research memory.
+- [`prompts.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/prompts.py)
+  Prompt templates for all role stages.
+- [`schemas.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/schemas.py)
+  JSON Schemas for structured outputs.
+
+## Installation
 
 ```bash
 cd /Users/kunpai/Documents/Playground/deep_research_ollama
@@ -169,33 +286,43 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-2. Pick a model provider.
+## Environment Variables
 
-- For local Ollama, make sure Ollama is running and the model exists.
-- For remote providers, bring your API key.
-
-3. Optional environment variables:
+Core model routing:
 
 ```bash
 export LLM_PROVIDER=ollama
 export LLM_MODEL=gemma4:e4b
 export LLM_API_BASE=http://127.0.0.1:11434
-export LLM_API_KEY=...
-export GEMINI_API_KEY=...
-export OPENAI_API_KEY=...
-export ANTHROPIC_API_KEY=...
-export OPENROUTER_API_KEY=...
-export GOOGLE_API_KEY=...
-export GOOGLE_CSE_ID=...
-export SERPAPI_API_KEY=...
-export SEMANTIC_SCHOLAR_API_KEY=...
+export LLM_API_KEY=
 ```
 
-If neither Google CSE nor SerpAPI is configured, the pipeline falls back to DuckDuckGo HTML for web search.
+Search backends:
 
-## Usage
+```bash
+export GOOGLE_API_KEY=
+export GOOGLE_CSE_ID=
+export SERPAPI_API_KEY=
+export SEMANTIC_SCHOLAR_API_KEY=
+```
 
-Interactive run:
+Common provider-specific keys the app understands include:
+
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `GEMINI_API_KEY`
+- `GOOGLE_API_KEY`
+- `OPENROUTER_API_KEY`
+- `GROQ_API_KEY`
+- `NVIDIA_NIM_API_KEY`
+- `MISTRAL_API_KEY`
+- `COHERE_API_KEY`
+
+If Google CSE and SerpAPI are not configured, web search falls back to DuckDuckGo HTML.
+
+## CLI Usage
+
+Basic run:
 
 ```bash
 deep-research run "retrieval-augmented generation for scientific assistants" \
@@ -217,7 +344,17 @@ deep-research run "retrieval-augmented generation for scientific assistants" \
   --output-dir /Users/kunpai/Documents/Playground/deep_research_ollama/output/rag_science
 ```
 
-Show or modify the persistent constitution:
+Example with NVIDIA NIM:
+
+```bash
+deep-research run "AI for hardware chip design" \
+  --provider nvidia_nim \
+  --model qwen/qwen3.5-122b-a10b \
+  --api-base https://integrate.api.nvidia.com/v1 \
+  --output-dir /Users/kunpai/Documents/Playground/deep_research_ollama/output/chip_design
+```
+
+Constitution commands:
 
 ```bash
 deep-research show-constitution \
@@ -230,14 +367,14 @@ deep-research delete-finding finding-2 \
   --output-dir /Users/kunpai/Documents/Playground/deep_research_ollama/output/rag_science
 ```
 
-Initialize the editable research program file:
+Initialize the run-level program:
 
 ```bash
 deep-research init-program \
   --output-dir /Users/kunpai/Documents/Playground/deep_research_ollama/output/rag_science
 ```
 
-Launch the local GUI:
+Launch the GUI:
 
 ```bash
 deep-research gui \
@@ -247,47 +384,56 @@ deep-research gui \
   --open-browser
 ```
 
-The GUI launches the existing pipeline in a background subprocess, lets you choose provider and model, accepts an API key for remote providers without writing it to artifacts, polls `run.json` and `constitution.json` for checkpointed progress, and lets you inspect `retrieval.json`, `report.tex`, `references.bib`, `constitution.json`, `report.pdf`, and `gui_run.log` from one page.
+## Useful CLI Knobs
+
+These overrides exist both in the CLI and, for the main ones, in the GUI:
+
+- `--max-queries`
+- `--max-total-queries`
+- `--max-search-rounds`
+- `--max-web-results-per-query`
+- `--max-paper-results-per-query`
+- `--max-selected-sources`
+- `--max-critic-results`
+- `--max-chunks-per-source`
+- `--max-summary-model-calls`
+
+Defaults in code today:
+
+- `max_queries = 6`
+- `max_total_queries = 14`
+- `max_search_rounds = 3`
+- `max_selected_sources = 8`
+- `max_critic_results = 16`
+- `max_chunks_per_source = 6`
+- `max_summary_model_calls = 18`
 
 ## Structured Outputs
 
-The pipeline uses schema-driven outputs for the LLM stages:
+The pipeline uses schema-driven structured outputs for:
 
 - clarifying questions
-- research planning
+- planning
 - retrieval strategy generation
-- collaborative worker turns
-- collaboration chair summary
+- critic judgments
 - source-note summaries
+- collaborative worker turns
+- chair summary
 - final synthesis
 
-The LiteLLM client sends `response_format` when the provider supports it, then validates the returned object locally before the pipeline accepts it. If provider-side structured output fails, the pipeline falls back to prompt-constrained JSON plus local validation.
+The client asks LiteLLM providers for structured responses when supported and validates the returned objects locally either way.
 
-## Design Choices
+## Limitations
 
-- Retrieval is not purely LLM-ranked.
-  Static scoring and greedy coverage selection are used so the search behavior is inspectable and less model-fragile.
-- Synthesis is not a single writer jump.
-  Worker roles debate the evidence first, so weak claims can be challenged before the final report is drafted.
-- Search is multi-backend by default.
-  This helps recover niche papers that may appear in Crossref or publisher pages but not arXiv or Semantic Scholar.
-- Source memory is persistent.
-  The constitution lets the system accumulate robust citation state across runs instead of rebuilding everything from scratch.
-- Chunked reading is mandatory for large sources.
-  This keeps local models usable on long PDFs and large HTML pages.
+- the collaborative roles are not true parallel workers
+- retrieval still admits weak web sources on broad topics
+- Crossref can still be noisy on ambiguous titles
+- Google Scholar is not integrated directly
+- search quality still depends heavily on query ambiguity and source availability
+- the writer can still fall back to source-note compilation if the chosen model is weak or times out
 
-## Known Limitations
+## Summary
 
-- Worker roles collaborate sequentially; there is still no real multi-process or multi-GPU execution layer.
-- Broad topics can still admit weak blog/tutorial/web sources.
-- Crossref can surface noisy matches on ambiguous topics.
-- Google Scholar is not integrated directly.
-- The final writer is only as good as the selected model/provider; when it fails, the system falls back to source-note compilation.
+If you want the current mental model, it is this:
 
-## Suggested Next Improvements
-
-- Parallel worker agents for retrieval, reading, and verification.
-- Better venue-aware ranking for broad topics.
-- More aggressive canonicalization of publisher landing pages.
-- Domain-specific reranking passes for bio, materials, and policy topics.
-- Better evaluation harnesses using saved `retrieval.json` traces.
+This project is a resumable local research engine with LiteLLM provider routing, heuristic-plus-critic retrieval, chunked document reading, collaborative report synthesis, persistent research memory, and LaTeX/PDF output. It is not yet a true parallel deep-research swarm, but it is already much more than a single prompt wrapped around search.
