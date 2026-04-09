@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from deep_research_ollama.providers import default_api_base, provider_metadata
 
 @dataclass(frozen=True)
 class Settings:
-    ollama_base_url: str = "http://127.0.0.1:11434"
-    ollama_model: str = "llama3.1"
+    llm_provider: str = "ollama"
+    llm_model: str = "llama3.1"
+    llm_api_base: str = "http://127.0.0.1:11434"
+    llm_api_key: str | None = None
     request_timeout_seconds: int = 90
     max_questions: int = 4
     max_queries: int = 6
@@ -46,9 +49,26 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         compile_latex_env = os.getenv("COMPILE_LATEX")
+        llm_provider = os.getenv("LLM_PROVIDER", cls.llm_provider).strip().lower() or cls.llm_provider
+        llm_model = (
+            os.getenv("LLM_MODEL")
+            or os.getenv("OLLAMA_MODEL")
+            or cls.llm_model
+        )
+        llm_api_base = (
+            os.getenv("LLM_API_BASE")
+            or os.getenv("OLLAMA_BASE_URL")
+            or default_api_base(llm_provider)
+        )
+        llm_api_key = (
+            os.getenv("LLM_API_KEY")
+            or _provider_api_key_from_env(llm_provider)
+        )
         return cls(
-            ollama_base_url=os.getenv("OLLAMA_BASE_URL", cls.ollama_base_url),
-            ollama_model=os.getenv("OLLAMA_MODEL", cls.ollama_model),
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_api_base=llm_api_base,
+            llm_api_key=llm_api_key,
             request_timeout_seconds=int(
                 os.getenv("REQUEST_TIMEOUT_SECONDS", str(cls.request_timeout_seconds))
             ),
@@ -128,3 +148,32 @@ class Settings:
             serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
             semantic_scholar_api_key=os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
         )
+
+    @property
+    def ollama_base_url(self) -> str:
+        return self.llm_api_base
+
+    @property
+    def ollama_model(self) -> str:
+        return self.llm_model
+
+    def resolved_model(self) -> str:
+        model = self.llm_model.strip()
+        provider = self.llm_provider.strip().lower() or "ollama"
+        if not model:
+            return ""
+        prefix = f"{provider}/"
+        if model.startswith(prefix):
+            return model
+        return f"{provider}/{model}"
+
+    def model_display_name(self) -> str:
+        return self.resolved_model() or "-"
+
+
+def _provider_api_key_from_env(provider: str) -> str | None:
+    for env_name in provider_metadata(provider).get("api_key_envs", []):
+        value = os.getenv(str(env_name))
+        if value:
+            return value
+    return None

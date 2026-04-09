@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,8 @@ from deep_research_ollama.config import Settings
 from deep_research_ollama.constitution import ConstitutionStore
 from deep_research_ollama.models import (
     CitationRecord,
+    CollaborationSession,
+    CollaborationTurn,
     Finding,
     ReportSection,
     ResearchPlan,
@@ -29,6 +32,8 @@ from deep_research_ollama.program import load_research_program
 from deep_research_ollama.prompts import (
     chunk_summary_prompt,
     clarifier_prompt,
+    collaboration_coordinator_prompt,
+    collaboration_worker_prompt,
     merge_source_prompt,
     planner_prompt,
     relevance_critic_prompt,
@@ -37,6 +42,8 @@ from deep_research_ollama.prompts import (
 )
 from deep_research_ollama.schemas import (
     clarifier_schema,
+    collaboration_session_schema,
+    collaboration_turn_schema,
     planner_schema,
     relevance_critic_schema,
     retrieval_strategy_schema,
@@ -91,6 +98,7 @@ class ResearchPipeline:
                 constitution=constitution,
                 documents=documents,
             )
+            collaboration = self._coerce_collaboration_session(checkpoint.get("collaboration"))
         else:
             answers = self.ask_clarifying_questions(
                 topic, prefilled_answers=initial_answers, interactive=interactive
@@ -101,6 +109,7 @@ class ResearchPipeline:
             documents = []
             citation_records = []
             note_by_source = {}
+            collaboration = CollaborationSession()
 
         if plan is None:
             plan = self.build_plan(topic, answers)
@@ -210,7 +219,38 @@ class ResearchPipeline:
                     note_by_source=notes,
                 ),
             )
-        synthesis = self.synthesize(topic, plan, answers, note_by_source, citation_records)
+        if not collaboration.turns:
+            collaboration = self.collaborate(
+                topic,
+                plan,
+                answers,
+                note_by_source,
+                citation_records,
+            )
+            self._write_checkpoint(
+                topic=topic,
+                status="collaborated",
+                answers=answers,
+                plan=plan,
+                retrieval=retrieval,
+                selected=selected,
+                documents=documents,
+                citations=citation_records,
+                note_by_source=note_by_source,
+                collaboration=collaboration,
+                progress={
+                    "collaboration_turns": len(collaboration.turns),
+                    "consensus_claims": len(collaboration.consensus_claims),
+                },
+            )
+        synthesis = self.synthesize(
+            topic,
+            plan,
+            answers,
+            note_by_source,
+            citation_records,
+            collaboration,
+        )
         self.constitution.apply_run(list(note_by_source.values()), citation_records, synthesis)
         paths = self.write_outputs(
             topic=topic,
@@ -222,13 +262,16 @@ class ResearchPipeline:
             source_notes=list(note_by_source.values()),
             synthesis=synthesis,
             retrieval=retrieval,
+            collaboration=collaboration,
         )
         return {
-            "model": self.settings.ollama_model,
+            "provider": self.settings.llm_provider,
+            "model": self.settings.model_display_name(),
             "answers": answers,
             "plan": plan.to_dict(),
             "selected_sources": [result.to_dict() for result in selected],
             "retrieval": retrieval,
+            "collaboration": collaboration.to_dict(),
             "paths": {name: str(path) for name, path in paths.items()},
         }
 
@@ -385,6 +428,85 @@ class ResearchPipeline:
                 continue
             notes[note.source_id] = note
         return notes
+
+    def _coerce_collaboration_session(self, payload: Any) -> CollaborationSession:
+        if not isinstance(payload, dict):
+            return CollaborationSession()
+
+        turns: list[CollaborationTurn] = []
+        for item in payload.get("turns", []):
+            if not isinstance(item, dict):
+                continue
+            turns.append(
+                CollaborationTurn(
+                    role=str(item.get("role", "")).strip(),
+                    summary=str(item.get("summary", "")).strip(),
+                    claims=self._coerce_collaboration_claims(item.get("claims", [])),
+                    criticisms=[
+                        str(entry).strip()
+                        for entry in item.get("criticisms", [])
+                        if str(entry).strip()
+                    ],
+                    open_questions=[
+                        str(entry).strip()
+                        for entry in item.get("open_questions", [])
+                        if str(entry).strip()
+                    ],
+                    messages_to_next=[
+                        str(entry).strip()
+                        for entry in item.get("messages_to_next", [])
+                        if str(entry).strip()
+                    ],
+                )
+            )
+
+        return CollaborationSession(
+            turns=turns,
+            consensus_claims=self._coerce_collaboration_claims(
+                payload.get("consensus_claims", [])
+            ),
+            disputed_claims=[
+                str(entry).strip()
+                for entry in payload.get("disputed_claims", [])
+                if str(entry).strip()
+            ],
+            open_questions=[
+                str(entry).strip()
+                for entry in payload.get("open_questions", [])
+                if str(entry).strip()
+            ],
+            coordinator_notes=[
+                str(entry).strip()
+                for entry in payload.get("coordinator_notes", [])
+                if str(entry).strip()
+            ],
+        )
+
+    @staticmethod
+    def _coerce_collaboration_claims(items: Any) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        claims: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim", "")).strip()
+            if not claim:
+                continue
+            citation_keys = [
+                str(entry).strip()
+                for entry in item.get("citation_keys", [])
+                if str(entry).strip()
+            ]
+            status = str(item.get("status", "")).strip() or "tentative"
+            claims.append(
+                {
+                    "claim": claim,
+                    "citation_keys": citation_keys,
+                    "status": status,
+                }
+            )
+        return claims
 
     @staticmethod
     def _strip_record_meta(item: dict[str, Any]) -> dict[str, Any]:
@@ -1088,6 +1210,139 @@ class ResearchPipeline:
                 on_note(notes[document.source_id], notes)
         return notes
 
+    def collaborate(
+        self,
+        topic: str,
+        plan: ResearchPlan,
+        answers: dict[str, str],
+        note_by_source: dict[str, SourceNote],
+        citations: list[CitationRecord],
+    ) -> CollaborationSession:
+        if not note_by_source or not citations:
+            return CollaborationSession()
+
+        source_notes = [note.to_dict() for note in note_by_source.values()]
+        citation_payloads = [citation.to_dict() for citation in citations]
+        citation_keys = [citation.cite_key for citation in citations]
+        turns: list[CollaborationTurn] = []
+
+        roles = [
+            (
+                "EvidenceAgent",
+                "Extract the strongest evidence-backed claims. Favor precise claims with direct citation support and call out any scope limits.",
+            ),
+            (
+                "SkepticAgent",
+                "Challenge overreach in prior turns. Downgrade or reject claims that are weakly grounded, ambiguous, or contradicted by the notes.",
+            ),
+            (
+                "GapAgent",
+                "Look for what the debate is missing: uncovered subtopics, missing comparisons, and unresolved methodological gaps.",
+            ),
+        ]
+
+        for role_name, role_instruction in roles:
+            system, user = collaboration_worker_prompt(
+                role_name=role_name,
+                role_instruction=role_instruction,
+                topic=topic,
+                rewritten_question=plan.rewritten_question,
+                answers=answers,
+                prior_turns=[turn.to_dict() for turn in turns],
+                source_notes=source_notes,
+                citations=citation_payloads,
+                program=self.program,
+            )
+            try:
+                payload = self.ollama.chat_json(
+                    system,
+                    user,
+                    schema=collaboration_turn_schema(citation_keys),
+                )
+            except OllamaError:
+                payload = {}
+            turns.append(self._coerce_collaboration_turn(payload, role_name))
+
+        system, user = collaboration_coordinator_prompt(
+            topic=topic,
+            rewritten_question=plan.rewritten_question,
+            answers=answers,
+            turns=[turn.to_dict() for turn in turns],
+            source_notes=source_notes,
+            citations=citation_payloads,
+            program=self.program,
+        )
+        try:
+            payload = self.ollama.chat_json(
+                system,
+                user,
+                schema=collaboration_session_schema(citation_keys),
+            )
+        except OllamaError:
+            payload = self._fallback_collaboration_payload(turns)
+        session = self._coerce_collaboration_session(payload)
+        if not session.turns:
+            session.turns = turns
+        elif len(session.turns) < len(turns):
+            session.turns.extend(turns[len(session.turns) :])
+        return session
+
+    def _coerce_collaboration_turn(
+        self,
+        payload: dict[str, Any],
+        role_name: str,
+    ) -> CollaborationTurn:
+        claims = self._coerce_collaboration_claims(payload.get("claims", []))
+        summary = str(payload.get("summary", "")).strip()
+        if not summary:
+            if claims:
+                summary = claims[0]["claim"]
+            else:
+                summary = f"{role_name} produced no structured summary."
+        return CollaborationTurn(
+            role=role_name,
+            summary=summary,
+            claims=claims,
+            criticisms=[
+                str(item).strip()
+                for item in payload.get("criticisms", [])
+                if str(item).strip()
+            ],
+            open_questions=[
+                str(item).strip()
+                for item in payload.get("open_questions", [])
+                if str(item).strip()
+            ],
+            messages_to_next=[
+                str(item).strip()
+                for item in payload.get("messages_to_next", [])
+                if str(item).strip()
+            ],
+        )
+
+    @staticmethod
+    def _fallback_collaboration_payload(turns: list[CollaborationTurn]) -> dict[str, Any]:
+        supported_claims: list[dict[str, Any]] = []
+        disputed_claims: list[str] = []
+        open_questions: list[str] = []
+        coordinator_notes: list[str] = []
+        for turn in turns:
+            for claim in turn.claims:
+                if claim.get("status") in {"supported", "tentative"} and claim not in supported_claims:
+                    supported_claims.append(claim)
+                if claim.get("status") in {"challenged", "rejected"}:
+                    disputed_claims.append(str(claim.get("claim", "")).strip())
+            open_questions.extend(turn.open_questions)
+            if turn.criticisms:
+                coordinator_notes.append(f"{turn.role}: " + "; ".join(turn.criticisms[:2]))
+        return {
+            "turns": [turn.to_dict() for turn in turns],
+            "consensus_claims": supported_claims[:8],
+            "disputed_claims": [item for item in disputed_claims if item][:8],
+            "open_questions": [item for item in open_questions if item][:8],
+            "coordinator_notes": coordinator_notes[:8],
+        }
+
     def synthesize(
         self,
         topic: str,
@@ -1095,6 +1350,7 @@ class ResearchPipeline:
         answers: dict[str, str],
         note_by_source: dict[str, SourceNote],
         citations: list[CitationRecord],
+        collaboration: CollaborationSession,
     ) -> SynthesisResult:
         system, user = writer_prompt(
             topic,
@@ -1103,6 +1359,7 @@ class ResearchPipeline:
             plan.source_requirements,
             answers,
             self.constitution.prompt_snapshot(),
+            collaboration.to_dict(),
             [note.to_dict() for note in note_by_source.values()],
             [citation.to_dict() for citation in citations],
             self.program,
@@ -1131,6 +1388,7 @@ class ResearchPipeline:
         source_notes: list[SourceNote],
         synthesis: SynthesisResult,
         retrieval: dict[str, Any],
+        collaboration: CollaborationSession,
     ) -> dict[str, Path]:
         report_path = self.output_dir / self.settings.report_filename
         references_path = self.output_dir / self.settings.references_filename
@@ -1158,7 +1416,8 @@ class ResearchPipeline:
                 {
                     "status": "completed",
                     "topic": topic,
-                    "model": self.settings.ollama_model,
+                    "provider": self.settings.llm_provider,
+                    "model": self.settings.model_display_name(),
                     "answers": answers,
                     "plan": plan.to_dict(),
                     "retrieval": retrieval,
@@ -1166,6 +1425,7 @@ class ResearchPipeline:
                     "documents": [item.to_dict() for item in documents],
                     "citations": [item.to_dict() for item in citations],
                     "source_notes": [item.to_dict() for item in source_notes],
+                    "collaboration": collaboration.to_dict(),
                     "synthesis": synthesis.to_dict(),
                     "compiled_pdf": str(compiled) if compiled else "",
                     "latex": {
@@ -1202,6 +1462,7 @@ class ResearchPipeline:
         documents: list[SourceDocument] | None = None,
         citations: list[CitationRecord] | None = None,
         note_by_source: dict[str, SourceNote] | None = None,
+        collaboration: CollaborationSession | None = None,
         synthesis: SynthesisResult | None = None,
         progress: dict[str, Any] | None = None,
     ) -> None:
@@ -1229,7 +1490,8 @@ class ResearchPipeline:
         payload: dict[str, Any] = {
             "status": status,
             "topic": topic,
-            "model": self.settings.ollama_model,
+            "provider": self.settings.llm_provider,
+            "model": self.settings.model_display_name(),
             "answers": answers,
             "plan": plan.to_dict(),
             "retrieval": retrieval or {},
@@ -1237,6 +1499,7 @@ class ResearchPipeline:
             "documents": [item.to_dict() for item in (documents or [])],
             "citations": [item.to_dict() for item in (citations or [])],
             "source_notes": [note.to_dict() for note in (note_by_source or {}).values()],
+            "collaboration": collaboration.to_dict() if collaboration is not None else None,
             "synthesis": synthesis.to_dict() if synthesis is not None else None,
             "compiled_pdf": "",
         }
@@ -1398,29 +1661,34 @@ class ResearchPipeline:
 
         pdf_path = report_path.with_suffix(".pdf")
         latexmk = shutil.which("latexmk")
+        latex_engine = self._preferred_latex_engine()
         if latexmk:
+            latexmk_flag = "-pdf"
+            if latex_engine and latex_engine.name == "lualatex":
+                latexmk_flag = "-lualatex"
+            elif latex_engine and latex_engine.name == "xelatex":
+                latexmk_flag = "-xelatex"
             command = [
                 latexmk,
-                "-pdf",
+                latexmk_flag,
                 "-interaction=nonstopmode",
                 "-halt-on-error",
                 report_path.name,
             ]
         else:
-            pdflatex = shutil.which("pdflatex")
             bibtex = shutil.which("bibtex")
-            if not pdflatex or not bibtex:
+            if not latex_engine or not bibtex:
                 return {
                     "pdf": None,
                     "status": "skipped",
-                    "message": "LaTeX tools not available. Install latexmk or pdflatex + bibtex.",
+                    "message": "LaTeX tools not available. Install latexmk or lualatex/xelatex/pdflatex + bibtex.",
                 }
             stem = report_path.stem
             commands = [
-                [pdflatex, "-interaction=nonstopmode", "-halt-on-error", report_path.name],
+                [str(latex_engine), "-interaction=nonstopmode", "-halt-on-error", report_path.name],
                 [bibtex, stem],
-                [pdflatex, "-interaction=nonstopmode", "-halt-on-error", report_path.name],
-                [pdflatex, "-interaction=nonstopmode", "-halt-on-error", report_path.name],
+                [str(latex_engine), "-interaction=nonstopmode", "-halt-on-error", report_path.name],
+                [str(latex_engine), "-interaction=nonstopmode", "-halt-on-error", report_path.name],
             ]
             for command in commands:
                 try:
@@ -1434,16 +1702,23 @@ class ResearchPipeline:
                         timeout=self.settings.latex_timeout_seconds,
                     )
                 except (OSError, subprocess.SubprocessError) as exc:
+                    detail = self._latex_failure_detail(report_path)
                     if pdf_path.exists():
                         return {
                             "pdf": pdf_path,
                             "status": "partial",
-                            "message": f"LaTeX command failed after producing a PDF: {exc}",
+                            "message": self._combine_failure_message(
+                                f"LaTeX command failed after producing a PDF: {exc}",
+                                detail,
+                            ),
                         }
                     return {
                         "pdf": None,
                         "status": "failed",
-                        "message": f"LaTeX command failed: {exc}",
+                        "message": self._combine_failure_message(
+                            f"LaTeX command failed: {exc}",
+                            detail,
+                        ),
                     }
             return {
                 "pdf": pdf_path if pdf_path.exists() else None,
@@ -1462,16 +1737,23 @@ class ResearchPipeline:
                 timeout=self.settings.latex_timeout_seconds,
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            detail = self._latex_failure_detail(report_path)
             if pdf_path.exists():
                 return {
                     "pdf": pdf_path,
                     "status": "partial",
-                    "message": f"latexmk failed after producing a PDF: {exc}",
+                    "message": self._combine_failure_message(
+                        f"latexmk failed after producing a PDF: {exc}",
+                        detail,
+                    ),
                 }
             return {
                 "pdf": None,
                 "status": "failed",
-                "message": f"latexmk failed: {exc}",
+                "message": self._combine_failure_message(
+                    f"latexmk failed: {exc}",
+                    detail,
+                ),
             }
         return {
             "pdf": pdf_path if pdf_path.exists() else None,
@@ -2406,7 +2688,30 @@ class ResearchPipeline:
     def _render_report(self, synthesis: SynthesisResult) -> str:
         sections: list[str] = [
             "\\documentclass{article}",
+            "\\usepackage{iftex}",
+            "\\ifPDFTeX",
             "\\usepackage[utf8]{inputenc}",
+            "\\usepackage[T1]{fontenc}",
+            "\\usepackage{textcomp}",
+            "\\else",
+            "\\usepackage{fontspec}",
+            "\\defaultfontfeatures{Ligatures=TeX}",
+            "\\setmainfont{Latin Modern Roman}",
+            "\\fi",
+            "\\IfFileExists{newunicodechar.sty}{%",
+            "\\usepackage{newunicodechar}",
+            "\\newunicodechar{≈}{\\ensuremath{\\approx}}",
+            "\\newunicodechar{≤}{\\ensuremath{\\leq}}",
+            "\\newunicodechar{≥}{\\ensuremath{\\geq}}",
+            "\\newunicodechar{±}{\\ensuremath{\\pm}}",
+            "\\newunicodechar{×}{\\ensuremath{\\times}}",
+            "\\newunicodechar{→}{\\ensuremath{\\rightarrow}}",
+            "\\newunicodechar{←}{\\ensuremath{\\leftarrow}}",
+            "\\newunicodechar{…}{\\ldots{}}",
+            "\\newunicodechar{–}{--}",
+            "\\newunicodechar{—}{---}",
+            "\\newunicodechar{📚}{}",
+            "}{}",
             "\\usepackage{hyperref}",
             "\\usepackage{natbib}",
             "\\title{" + self._escape_latex(synthesis.title) + "}",
@@ -3066,6 +3371,30 @@ class ResearchPipeline:
 
     @staticmethod
     def _escape_latex(value: str) -> str:
+        unicode_replacements = {
+            "\u00a0": " ",
+            "\u2009": " ",
+            "\u200b": "",
+            "\u2010": "-",
+            "\u2011": "-",
+            "\u2012": "--",
+            "\u2013": "--",
+            "\u2014": "---",
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u2022": "*",
+            "\u2026": "...",
+            "\u2192": "->",
+            "\u2190": "<-",
+            "\u2212": "-",
+            "\u2264": "<=",
+            "\u2265": ">=",
+            "\u00d7": "x",
+            "\u00b1": "+/-",
+            "\u2248": "~",
+        }
         replacements = {
             "\\": "\\textbackslash{}",
             "&": "\\&",
@@ -3078,4 +3407,47 @@ class ResearchPipeline:
             "~": "\\textasciitilde{}",
             "^": "\\textasciicircum{}",
         }
-        return "".join(replacements.get(char, char) for char in value)
+        normalized = unicodedata.normalize("NFKC", value)
+        cleaned: list[str] = []
+        for char in normalized:
+            if char in unicode_replacements:
+                cleaned.append(unicode_replacements[char])
+                continue
+            category = unicodedata.category(char)
+            if ord(char) > 0xFFFF or category in {"Cs", "Co", "Cn"}:
+                continue
+            if category == "So":
+                continue
+            cleaned.append(char)
+        return "".join(replacements.get(char, char) for char in "".join(cleaned))
+
+    def _latex_failure_detail(self, report_path: Path) -> str:
+        log_path = report_path.with_suffix(".log")
+        if not log_path.exists():
+            return ""
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("!"):
+                continue
+            detail = stripped.lstrip("!").strip()
+            if index + 1 < len(lines):
+                next_line = lines[index + 1].strip()
+                if next_line and not next_line.startswith("See the LaTeX manual"):
+                    detail = f"{detail} {next_line}".strip()
+            return detail
+        return ""
+
+    @staticmethod
+    def _combine_failure_message(base: str, detail: str) -> str:
+        if not detail:
+            return base
+        return f"{base} | {detail}"
+
+    @staticmethod
+    def _preferred_latex_engine() -> Path | None:
+        for name in ("lualatex", "xelatex", "pdflatex"):
+            binary = shutil.which(name)
+            if binary:
+                return Path(binary)
+        return None

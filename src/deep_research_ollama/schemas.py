@@ -141,6 +141,75 @@ def source_note_schema() -> dict[str, Any]:
     }
 
 
+def collaboration_turn_schema(citation_keys: list[str]) -> dict[str, Any]:
+    citation_key_schema = _enum_or_string_schema(citation_keys)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": "string"},
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "claim": {"type": "string"},
+                        "citation_keys": {"type": "array", "items": citation_key_schema},
+                        "status": {
+                            "type": "string",
+                            "enum": ["supported", "tentative", "challenged", "rejected"],
+                        },
+                    },
+                    "required": ["claim", "citation_keys", "status"],
+                },
+            },
+            "criticisms": _string_array_schema(),
+            "open_questions": _string_array_schema(),
+            "messages_to_next": _string_array_schema(),
+        },
+        "required": [
+            "summary",
+            "claims",
+            "criticisms",
+            "open_questions",
+            "messages_to_next",
+        ],
+    }
+
+
+def collaboration_session_schema(citation_keys: list[str]) -> dict[str, Any]:
+    citation_key_schema = _enum_or_string_schema(citation_keys)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "consensus_claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "claim": {"type": "string"},
+                        "citation_keys": {"type": "array", "items": citation_key_schema},
+                        "status": {"type": "string", "enum": ["supported", "tentative"]},
+                    },
+                    "required": ["claim", "citation_keys", "status"],
+                },
+            },
+            "disputed_claims": _string_array_schema(),
+            "open_questions": _string_array_schema(),
+            "coordinator_notes": _string_array_schema(),
+        },
+        "required": [
+            "consensus_claims",
+            "disputed_claims",
+            "open_questions",
+            "coordinator_notes",
+        ],
+    }
+
+
 def writer_schema(citation_keys: list[str]) -> dict[str, Any]:
     citation_key_schema = _enum_or_string_schema(citation_keys)
     return {

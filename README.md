@@ -1,6 +1,6 @@
-# Deep Research with Ollama
+# Deep Research with LiteLLM
 
-Local-first deep research pipeline built around Ollama, paper/web search, BibTeX resolution, and LaTeX report generation.
+Local-first deep research pipeline built around LiteLLM, paper/web search, BibTeX resolution, and LaTeX report generation.
 
 It asks clarifying questions, rewrites the topic into a tighter research brief, searches across multiple backends, reads large sources in chunks, resolves citations, keeps a persistent research constitution, and emits report artifacts you can inspect or edit.
 
@@ -9,12 +9,14 @@ It asks clarifying questions, rewrites the topic into a tighter research brief, 
 The system is in a solid prototype state:
 
 - Structured outputs are schema-driven per stage.
+- Model routing is provider-agnostic through LiteLLM.
 - Retrieval is now a hybrid of LLM-guided strategy plus static ranking and coverage heuristics.
 - Large papers are chunked and summarized incrementally.
 - The system keeps persistent research memory in `constitution.json` and `constitution.bib`.
+- Source synthesis now includes a collaborative worker debate before final writing.
 - Broad or ambiguous topics are much better than before, but still weaker than narrow technical topics.
 
-One important detail: the "agents" are currently role-based sequential stages, not parallel workers. The stages behave like specialized agents, but they execute in one pipeline.
+One important detail: the "agents" are collaborative worker roles with message passing, not true GPU-parallel execution. They behave like a debate loop inside one pipeline.
 
 ## System Diagram
 
@@ -28,7 +30,8 @@ flowchart LR
     SEL --> F["Fetcher\nHTML / PDF / arXiv"]
     F --> SUM["Reader\nchunk summaries + merge"]
     SUM --> CIT["Citation Resolver\nCrossref / arXiv / web BibTeX"]
-    CIT --> W["Writer\nLaTeX sections + findings"]
+    CIT --> COLLAB["Collaborative Workers\nEvidence / Skeptic / Gap / Chair"]
+    COLLAB --> W["Writer\nLaTeX sections + findings"]
     W --> CONS["Constitution Store\nnotes / findings / citations"]
     CONS --> OUT["Artifacts\nreport.tex\nreferences.bib\nretrieval.json\nrun.json"]
 
@@ -74,9 +77,10 @@ flowchart TD
     P --> R["Summarize chunks"]
     Q --> R
     R --> S["Resolve BibTeX"]
-    S --> T["Synthesize report"]
-    T --> U["Update constitution"]
-    U --> V["Write report.tex / references.bib / retrieval.json / run.json"]
+    S --> T["Collaborative worker debate"]
+    T --> U["Synthesize report"]
+    U --> V["Update constitution"]
+    V --> W["Write report.tex / references.bib / retrieval.json / run.json"]
 ```
 
 ## Retrieval Loop
@@ -100,11 +104,13 @@ flowchart TD
 ## What It Does
 
 - Clarifies the task before research starts.
+- Routes model calls through LiteLLM, so you can swap providers like Ollama, Gemini, OpenAI, Anthropic, or OpenRouter.
 - Rewrites the request into a sharper research brief.
 - Generates topic-specific retrieval strategy with schema-constrained LLM output and heuristic fallback.
 - Searches `arXiv`, `Semantic Scholar`, `Crossref`, `Google CSE`, `SerpAPI`, or `DuckDuckGo HTML`.
 - Promotes likely paper landing pages into canonical paper records when possible.
 - Reads large PDFs and long documents in chunks.
+- Runs an internal worker debate over the gathered evidence before final writing.
 - Resolves DOI-backed BibTeX via Crossref when possible.
 - Falls back to arXiv or generated web BibTeX when needed.
 - Stores findings, notes, and citations in a persistent constitution.
@@ -118,8 +124,10 @@ flowchart TD
   End-to-end orchestration: clarify, plan, retrieve, select, summarize, synthesize, write outputs.
 - [`tools.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/tools.py)
   Search backends, dedupe, promotion, document fetching, chunking.
-- [`ollama.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/ollama.py)
-  Ollama client with schema-backed structured outputs.
+- [`llm.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/llm.py)
+  LiteLLM-backed provider-agnostic client with schema validation and JSON fallback.
+- [`providers.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/providers.py)
+  Provider metadata, suggested models, and GUI/API-key environment wiring.
 - [`schemas.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/schemas.py)
   JSON Schemas for each LLM stage.
 - [`citations.py`](/Users/kunpai/Documents/Playground/deep_research_ollama/src/deep_research_ollama/citations.py)
@@ -161,12 +169,22 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-2. Make sure Ollama is running locally and the model exists.
+2. Pick a model provider.
+
+- For local Ollama, make sure Ollama is running and the model exists.
+- For remote providers, bring your API key.
 
 3. Optional environment variables:
 
 ```bash
-export OLLAMA_MODEL=gemma4:e4b
+export LLM_PROVIDER=ollama
+export LLM_MODEL=gemma4:e4b
+export LLM_API_BASE=http://127.0.0.1:11434
+export LLM_API_KEY=...
+export GEMINI_API_KEY=...
+export OPENAI_API_KEY=...
+export ANTHROPIC_API_KEY=...
+export OPENROUTER_API_KEY=...
 export GOOGLE_API_KEY=...
 export GOOGLE_CSE_ID=...
 export SERPAPI_API_KEY=...
@@ -181,6 +199,8 @@ Interactive run:
 
 ```bash
 deep-research run "retrieval-augmented generation for scientific assistants" \
+  --provider gemini \
+  --model gemini-2.5-flash \
   --output-dir /Users/kunpai/Documents/Playground/deep_research_ollama/output/rag_science
 ```
 
@@ -189,6 +209,8 @@ Non-interactive run:
 ```bash
 deep-research run "retrieval-augmented generation for scientific assistants" \
   --no-clarify \
+  --provider ollama \
+  --model gemma4:e4b \
   --answer objective="compare RAG architectures for literature assistants" \
   --answer audience="ML engineers" \
   --answer constraints="prefer surveys, benchmarks, and production systems" \
@@ -225,7 +247,7 @@ deep-research gui \
   --open-browser
 ```
 
-The GUI launches the existing pipeline in a background subprocess, polls `run.json` and `constitution.json` for checkpointed progress, and lets you inspect `retrieval.json`, `report.tex`, `references.bib`, `constitution.json`, and `gui_run.log` from one page.
+The GUI launches the existing pipeline in a background subprocess, lets you choose provider and model, accepts an API key for remote providers without writing it to artifacts, polls `run.json` and `constitution.json` for checkpointed progress, and lets you inspect `retrieval.json`, `report.tex`, `references.bib`, `constitution.json`, `report.pdf`, and `gui_run.log` from one page.
 
 ## Structured Outputs
 
@@ -234,15 +256,19 @@ The pipeline uses schema-driven outputs for the LLM stages:
 - clarifying questions
 - research planning
 - retrieval strategy generation
+- collaborative worker turns
+- collaboration chair summary
 - source-note summaries
 - final synthesis
 
-The Ollama client sends the schema through the `format` field and validates the returned object before the pipeline accepts it.
+The LiteLLM client sends `response_format` when the provider supports it, then validates the returned object locally before the pipeline accepts it. If provider-side structured output fails, the pipeline falls back to prompt-constrained JSON plus local validation.
 
 ## Design Choices
 
 - Retrieval is not purely LLM-ranked.
   Static scoring and greedy coverage selection are used so the search behavior is inspectable and less model-fragile.
+- Synthesis is not a single writer jump.
+  Worker roles debate the evidence first, so weak claims can be challenged before the final report is drafted.
 - Search is multi-backend by default.
   This helps recover niche papers that may appear in Crossref or publisher pages but not arXiv or Semantic Scholar.
 - Source memory is persistent.
@@ -252,11 +278,11 @@ The Ollama client sends the schema through the `format` field and validates the 
 
 ## Known Limitations
 
-- Role-based "agents" are sequential, not parallel workers.
+- Worker roles collaborate sequentially; there is still no real multi-process or multi-GPU execution layer.
 - Broad topics can still admit weak blog/tutorial/web sources.
 - Crossref can surface noisy matches on ambiguous topics.
 - Google Scholar is not integrated directly.
-- The final writer is only as good as the local model; when it fails, the system falls back to source-note compilation.
+- The final writer is only as good as the selected model/provider; when it fails, the system falls back to source-note compilation.
 
 ## Suggested Next Improvements
 

@@ -15,7 +15,7 @@ from deep_research_ollama.program import DEFAULT_RESEARCH_PROGRAM
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deep-research",
-        description="Deep research with Ollama, search tools, BibTeX, and LaTeX output.",
+        description="Deep research with LiteLLM, search tools, BibTeX, and LaTeX output.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -38,9 +38,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pre-supply a clarifying answer as key=value. Can be repeated.",
     )
     run_parser.add_argument(
+        "--provider",
+        default="",
+        help="Override the LiteLLM provider for this run, for example ollama, gemini, openai, or anthropic.",
+    )
+    run_parser.add_argument(
         "--model",
         default="",
-        help="Override the Ollama model for this run.",
+        help="Override the model for this run.",
+    )
+    run_parser.add_argument(
+        "--api-base",
+        default="",
+        help="Override the provider API base URL for this run.",
     )
     run_parser.add_argument(
         "--max-summary-model-calls",
@@ -48,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the summary-call budget for this run.",
     )
+    _add_knob_arguments(run_parser)
 
     show_parser = subparsers.add_parser(
         "show-constitution", help="Show the current constitution snapshot."
@@ -110,9 +121,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Open the GUI in the default browser after the server starts.",
     )
     gui_parser.add_argument(
+        "--provider",
+        default="",
+        help="Default LiteLLM provider to prefill in the GUI.",
+    )
+    gui_parser.add_argument(
         "--model",
         default="",
-        help="Default Ollama model to prefill in the GUI.",
+        help="Default model to prefill in the GUI.",
+    )
+    gui_parser.add_argument(
+        "--api-base",
+        default="",
+        help="Default provider API base URL to prefill in the GUI.",
     )
     gui_parser.add_argument(
         "--max-summary-model-calls",
@@ -120,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Default summary-call budget to prefill in the GUI.",
     )
+    _add_knob_arguments(gui_parser)
 
     return parser
 
@@ -128,10 +150,15 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     settings = Settings.from_env()
+    if getattr(args, "provider", "").strip():
+        settings = replace(settings, llm_provider=args.provider.strip().lower())
     if getattr(args, "model", "").strip():
-        settings = replace(settings, ollama_model=args.model.strip())
+        settings = replace(settings, llm_model=args.model.strip())
+    if getattr(args, "api_base", "").strip():
+        settings = replace(settings, llm_api_base=args.api_base.strip())
     if getattr(args, "max_summary_model_calls", None) is not None:
         settings = replace(settings, max_summary_model_calls=int(args.max_summary_model_calls))
+    settings = _apply_knob_overrides(settings, args)
 
     if args.command == "gui":
         start_gui(
@@ -198,3 +225,74 @@ def _parse_answers(entries: list[str]) -> dict[str, str]:
             raise SystemExit(f"Invalid --answer value '{entry}'. Expected key=value.")
         answers[key] = value
     return answers
+
+
+def _add_knob_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-queries",
+        type=int,
+        default=None,
+        help="Maximum seed queries generated before expansion.",
+    )
+    parser.add_argument(
+        "--max-total-queries",
+        type=int,
+        default=None,
+        help="Maximum total queries across all retrieval rounds.",
+    )
+    parser.add_argument(
+        "--max-search-rounds",
+        type=int,
+        default=None,
+        help="Maximum retrieval expansion rounds.",
+    )
+    parser.add_argument(
+        "--max-web-results-per-query",
+        type=int,
+        default=None,
+        help="Maximum web results fetched per query.",
+    )
+    parser.add_argument(
+        "--max-paper-results-per-query",
+        type=int,
+        default=None,
+        help="Maximum paper results fetched per query.",
+    )
+    parser.add_argument(
+        "--max-selected-sources",
+        type=int,
+        default=None,
+        help="Maximum sources selected for reading and synthesis.",
+    )
+    parser.add_argument(
+        "--max-critic-results",
+        type=int,
+        default=None,
+        help="Maximum shortlist size passed to the critic.",
+    )
+    parser.add_argument(
+        "--max-chunks-per-source",
+        type=int,
+        default=None,
+        help="Maximum chunks read from each source.",
+    )
+
+
+def _apply_knob_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
+    replacements: dict[str, int] = {}
+    for name in (
+        "max_queries",
+        "max_total_queries",
+        "max_search_rounds",
+        "max_web_results_per_query",
+        "max_paper_results_per_query",
+        "max_selected_sources",
+        "max_critic_results",
+        "max_chunks_per_source",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            replacements[name] = int(value)
+    if not replacements:
+        return settings
+    return replace(settings, **replacements)

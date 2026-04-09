@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import shutil
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from deep_research_ollama.config import Settings
 from deep_research_ollama.models import (
     CitationRecord,
+    CollaborationSession,
     ResearchPlan,
     SearchResult,
     SourceDocument,
@@ -1115,7 +1117,14 @@ class PipelineTests(unittest.TestCase):
             )
         ]
 
-        synthesis = pipeline.synthesize("scaling laws", plan, {}, notes, citations)
+        synthesis = pipeline.synthesize(
+            "scaling laws",
+            plan,
+            {},
+            notes,
+            citations,
+            CollaborationSession(),
+        )
 
         self.assertTrue(synthesis.sections)
         all_citation_keys = [
@@ -1191,7 +1200,14 @@ class PipelineTests(unittest.TestCase):
             )
         ]
 
-        synthesis = pipeline.synthesize("scaling laws", plan, {}, notes, citations)
+        synthesis = pipeline.synthesize(
+            "scaling laws",
+            plan,
+            {},
+            notes,
+            citations,
+            CollaborationSession(),
+        )
 
         self.assertEqual(synthesis.delete_citation_keys, ["legacy2022"])
         self.assertEqual(synthesis.delete_finding_ids, ["legacy-finding"])
@@ -1203,6 +1219,95 @@ class PipelineTests(unittest.TestCase):
             any("current-run finding" in note for note in synthesis.notes),
             synthesis.notes,
         )
+
+    def test_collaborate_runs_worker_debate_and_coordinator(self) -> None:
+        pipeline, tempdir = self.make_pipeline()
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = RoleAwareOllama(
+            {
+                "You are EvidenceAgent.": {
+                    "summary": "Primary evidence supports predictable scaling.",
+                    "claims": [
+                        {
+                            "claim": "Scaling appears predictable with model size.",
+                            "citation_keys": ["kaplan2020scaling"],
+                            "status": "supported",
+                        }
+                    ],
+                    "criticisms": [],
+                    "open_questions": ["How robust is the compute scaling law?"],
+                    "messages_to_next": ["Stress-test whether the evidence is overgeneralized."],
+                },
+                "You are SkepticAgent.": {
+                    "summary": "The evidence is real but narrow.",
+                    "claims": [
+                        {
+                            "claim": "Some scaling claims are narrower than broad headlines suggest.",
+                            "citation_keys": ["kaplan2020scaling"],
+                            "status": "challenged",
+                        }
+                    ],
+                    "criticisms": ["Do not claim universality from one paper."],
+                    "open_questions": [],
+                    "messages_to_next": ["Check for missing subtopics or benchmarks."],
+                },
+                "You are GapAgent.": {
+                    "summary": "The debate is missing evaluation coverage.",
+                    "claims": [],
+                    "criticisms": ["Benchmark diversity is still thin."],
+                    "open_questions": ["What downstream tasks were covered?"],
+                    "messages_to_next": ["Preserve the uncertainty in the final synthesis."],
+                },
+                "You are ChairAgent.": {
+                    "consensus_claims": [
+                        {
+                            "claim": "Scaling with model size is supported, but scope limits should be stated.",
+                            "citation_keys": ["kaplan2020scaling"],
+                            "status": "supported",
+                        }
+                    ],
+                    "disputed_claims": ["Universal scaling claims across all settings."],
+                    "open_questions": ["What downstream tasks were covered?"],
+                    "coordinator_notes": ["Keep the final report conservative and source-grounded."],
+                },
+            }
+        )
+
+        plan = ResearchPlan(
+            queries=["scaling laws"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Review transformer scaling law evidence.",
+            must_cover=[],
+            source_requirements=[],
+        )
+        notes = {
+            "s1": SourceNote(
+                source_id="s1",
+                title="Scaling Laws for Neural Language Models",
+                url="https://arxiv.org/abs/2001.08361",
+                citation_key="kaplan2020scaling",
+                summary="Scaling laws show predictable scaling with model size, data, and compute.",
+                claims=["predictable scaling with model size"],
+                evidence_snippets=["predictable scaling with model size"],
+            )
+        }
+        citations = [
+            CitationRecord(
+                cite_key="kaplan2020scaling",
+                bibtex="@misc{kaplan2020scaling, title={Scaling Laws for Neural Language Models}}",
+                title="Scaling Laws for Neural Language Models",
+                url="https://arxiv.org/abs/2001.08361",
+                source_id="s1",
+            )
+        ]
+
+        session = pipeline.collaborate("scaling laws", plan, {}, notes, citations)
+
+        self.assertEqual([turn.role for turn in session.turns], ["EvidenceAgent", "SkepticAgent", "GapAgent"])
+        self.assertEqual(session.consensus_claims[0]["citation_keys"], ["kaplan2020scaling"])
+        self.assertIn("Universal scaling claims", session.disputed_claims[0])
+        self.assertIn("final report conservative", session.coordinator_notes[0])
 
     def test_build_plan_falls_back_when_ollama_times_out(self) -> None:
         pipeline, tempdir = self.make_pipeline(max_queries=4)
@@ -1492,6 +1597,7 @@ class PipelineTests(unittest.TestCase):
                 source_notes=source_notes,
                 synthesis=synthesis,
                 retrieval={},
+                collaboration=CollaborationSession(),
             )
 
         self.assertIn("pdf", paths)
@@ -1545,6 +1651,7 @@ class PipelineTests(unittest.TestCase):
                 source_notes=[],
                 synthesis=synthesis,
                 retrieval={},
+                collaboration=CollaborationSession(),
             )
 
         self.assertNotIn("pdf", paths)
@@ -1600,12 +1707,95 @@ class PipelineTests(unittest.TestCase):
             source_notes=[],
             synthesis=synthesis,
             retrieval={},
+            collaboration=CollaborationSession(),
         )
 
         references_text = (pipeline.output_dir / pipeline.settings.references_filename).read_text(
             encoding="utf-8"
         )
         self.assertIn("Chip Design \\& Chip Design for AI", references_text)
+
+    def test_render_report_strips_emoji_from_latex_text(self) -> None:
+        pipeline, tempdir = self.make_pipeline(compile_latex=False)
+        self.addCleanup(tempdir.cleanup)
+
+        synthesis = pipeline._coerce_synthesis_payload(
+            {
+                "title": "RTL list 📚",
+                "abstract": "Emoji 📚 should not reach pdflatex.",
+                "sections": [
+                    {
+                        "heading": "Findings",
+                        "paragraphs": [
+                            {"text": "GitHub list 📚 with dash – preserved safely.", "citation_keys": []},
+                        ],
+                    }
+                ],
+                "findings": [],
+                "notes": [],
+                "delete_citation_keys": [],
+                "delete_finding_ids": [],
+            },
+            "RTL list",
+        )
+
+        report = pipeline._render_report(synthesis)
+        body = report.split("\\begin{document}", 1)[-1]
+
+        self.assertNotIn("📚", body)
+        self.assertIn("dash -- preserved safely.", report)
+        self.assertIn("\\usepackage{iftex}", report)
+        self.assertIn("\\IfFileExists{newunicodechar.sty}", report)
+
+    def test_compile_latex_prefers_lualatex_with_latexmk(self) -> None:
+        pipeline, tempdir = self.make_pipeline()
+        self.addCleanup(tempdir.cleanup)
+
+        report_path = pipeline.output_dir / "report.tex"
+        report_path.write_text("stub", encoding="utf-8")
+
+        def fake_run(command: list[str], cwd: Path, **_: object) -> object:
+            self.assertEqual(command[0], "/usr/bin/latexmk")
+            self.assertIn("-lualatex", command)
+            (Path(cwd) / "report.pdf").write_bytes(b"%PDF-1.4\n")
+            return object()
+
+        def fake_which(name: str) -> str | None:
+            mapping = {
+                "latexmk": "/usr/bin/latexmk",
+                "lualatex": "/usr/bin/lualatex",
+            }
+            return mapping.get(name)
+
+        with (
+            patch.object(shutil, "which", side_effect=fake_which),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            result = pipeline._compile_latex(report_path)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["pdf"])
+
+    def test_compile_latex_surfaces_fatal_log_detail(self) -> None:
+        pipeline, tempdir = self.make_pipeline()
+        self.addCleanup(tempdir.cleanup)
+
+        report_path = pipeline.output_dir / "report.tex"
+        report_path.write_text("stub", encoding="utf-8")
+        (pipeline.output_dir / "report.log").write_text(
+            "! LaTeX Error: Unicode character 📚 (U+1F4DA)\n"
+            "not set up for use with LaTeX.\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(shutil, "which", side_effect=lambda name: "/usr/bin/latexmk" if name == "latexmk" else None),
+            patch("subprocess.run", side_effect=subprocess.CalledProcessError(12, ["/usr/bin/latexmk"])),
+        ):
+            result = pipeline._compile_latex(report_path)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Unicode character", result["message"])
 
 
 if __name__ == "__main__":

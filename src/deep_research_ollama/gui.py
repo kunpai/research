@@ -12,14 +12,23 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 from deep_research_ollama.config import Settings
+from deep_research_ollama.providers import (
+    default_api_base,
+    provider_api_env_overrides,
+    provider_metadata,
+    provider_names,
+    suggested_models,
+)
 
 
-def list_available_models(settings: Settings) -> list[str]:
-    models = _list_models_from_manifests()
-    if models:
-        return models
-    models = _list_models_from_ollama_cli(timeout_seconds=2)
-    return models
+def list_available_models(settings: Settings, provider: str) -> list[str]:
+    normalized = provider.strip().lower() or settings.llm_provider
+    if normalized == "ollama":
+        models = _list_models_from_manifests()
+        if models:
+            return models
+        return _list_models_from_ollama_cli(timeout_seconds=2)
+    return suggested_models(normalized)
 
 
 def build_run_command(
@@ -27,8 +36,18 @@ def build_run_command(
     topic: str,
     output_dir: Path,
     answers: dict[str, str],
+    provider: str,
     model: str,
+    api_base: str,
     max_summary_model_calls: int | None,
+    max_queries: int | None,
+    max_total_queries: int | None,
+    max_search_rounds: int | None,
+    max_web_results_per_query: int | None,
+    max_paper_results_per_query: int | None,
+    max_selected_sources: int | None,
+    max_critic_results: int | None,
+    max_chunks_per_source: int | None,
     no_clarify: bool,
 ) -> list[str]:
     command = [
@@ -40,10 +59,30 @@ def build_run_command(
         "--output-dir",
         str(output_dir),
     ]
+    if provider.strip():
+        command.extend(["--provider", provider.strip().lower()])
     if model.strip():
         command.extend(["--model", model.strip()])
+    if api_base.strip():
+        command.extend(["--api-base", api_base.strip()])
     if max_summary_model_calls is not None:
         command.extend(["--max-summary-model-calls", str(int(max_summary_model_calls))])
+    if max_queries is not None:
+        command.extend(["--max-queries", str(int(max_queries))])
+    if max_total_queries is not None:
+        command.extend(["--max-total-queries", str(int(max_total_queries))])
+    if max_search_rounds is not None:
+        command.extend(["--max-search-rounds", str(int(max_search_rounds))])
+    if max_web_results_per_query is not None:
+        command.extend(["--max-web-results-per-query", str(int(max_web_results_per_query))])
+    if max_paper_results_per_query is not None:
+        command.extend(["--max-paper-results-per-query", str(int(max_paper_results_per_query))])
+    if max_selected_sources is not None:
+        command.extend(["--max-selected-sources", str(int(max_selected_sources))])
+    if max_critic_results is not None:
+        command.extend(["--max-critic-results", str(int(max_critic_results))])
+    if max_chunks_per_source is not None:
+        command.extend(["--max-chunks-per-source", str(int(max_chunks_per_source))])
     if no_clarify:
         command.append("--no-clarify")
     for key, value in answers.items():
@@ -57,6 +96,7 @@ def collect_run_status(
     output_dir: Path,
     settings: Settings,
     process: subprocess.Popen[str] | None = None,
+    process_provider: str = "",
     process_model: str = "",
     process_budget: int | None = None,
 ) -> dict[str, Any]:
@@ -103,6 +143,7 @@ def collect_run_status(
     return {
         "output_dir": str(output_dir),
         "topic": str(run_payload.get("topic", "") or constitution_payload.get("topic", "")),
+        "provider": str(run_payload.get("provider", "") or process_provider),
         "model": str(run_payload.get("model", "") or process_model),
         "status": status,
         "run_stage": stage,
@@ -229,6 +270,7 @@ class GuiApp:
         self.output_root = output_root.expanduser().resolve()
         self.launch_cwd = launch_cwd
         self.processes: dict[str, subprocess.Popen[str]] = {}
+        self.process_providers: dict[str, str] = {}
         self.process_models: dict[str, str] = {}
         self.process_budgets: dict[str, int] = {}
 
@@ -267,12 +309,32 @@ class GuiApp:
             self._send_html(handler, self.render_index())
             return
         if parsed.path == "/api/models":
+            query = parse_qs(parsed.query)
+            provider = str(query.get("provider", [self.settings.llm_provider])[0]).strip().lower()
+            metadata = provider_metadata(provider)
+            default_provider_base = (
+                self.settings.llm_api_base
+                if provider == self.settings.llm_provider and self.settings.llm_api_base.strip()
+                else default_api_base(provider)
+            )
             self._send_json(
                 handler,
                 {
-                    "models": list_available_models(self.settings),
-                    "default_model": self.settings.ollama_model,
+                    "provider": provider,
+                    "providers": [
+                        {"id": name, "label": provider_metadata(name)["label"]}
+                        for name in provider_names()
+                    ],
+                    "models": list_available_models(self.settings, provider),
+                    "default_model": self.settings.llm_model,
+                    "default_provider": self.settings.llm_provider,
+                    "default_api_base": default_provider_base,
                     "default_max_summary_model_calls": self.settings.max_summary_model_calls,
+                    "requires_api_key": bool(metadata.get("requires_api_key")),
+                    "api_key_label": str(metadata.get("api_key_label", "API Key")),
+                    "api_base_label": str(metadata.get("api_base_label", "API Base")),
+                    "api_base_placeholder": str(metadata.get("api_base_placeholder", "")),
+                    "model_hint": str(metadata.get("model_hint", "")),
                 },
             )
             return
@@ -280,6 +342,7 @@ class GuiApp:
             query = parse_qs(parsed.query)
             output_dir = self._resolve_output_dir(query.get("output_dir", [""])[0])
             process = self.processes.get(str(output_dir))
+            process_provider = self.process_providers.get(str(output_dir), "")
             process_model = self.process_models.get(str(output_dir), "")
             process_budget = self.process_budgets.get(str(output_dir))
             self._send_json(
@@ -288,6 +351,7 @@ class GuiApp:
                     output_dir=output_dir,
                     settings=self.settings,
                     process=process,
+                    process_provider=process_provider,
                     process_model=process_model,
                     process_budget=process_budget,
                 ),
@@ -344,12 +408,46 @@ class GuiApp:
             if str(key).strip() and str(value).strip()
         } if isinstance(answers_payload, dict) else {}
         no_clarify = bool(payload.get("no_clarify", True))
-        model = str(payload.get("model", "")).strip() or self.settings.ollama_model
+        provider = str(payload.get("provider", "")).strip().lower() or self.settings.llm_provider
+        model = str(payload.get("model", "")).strip() or self.settings.llm_model
+        api_base = str(payload.get("api_base", "")).strip() or default_api_base(provider)
+        api_key = str(payload.get("api_key", "")).strip()
         budget_value = payload.get("max_summary_model_calls", self.settings.max_summary_model_calls)
         try:
             max_summary_model_calls = max(1, int(budget_value))
         except (TypeError, ValueError):
             max_summary_model_calls = self.settings.max_summary_model_calls
+        knob_values = {
+            "max_queries": _coerce_positive_int(payload.get("max_queries"), self.settings.max_queries),
+            "max_total_queries": _coerce_positive_int(
+                payload.get("max_total_queries"),
+                self.settings.max_total_queries,
+            ),
+            "max_search_rounds": _coerce_positive_int(
+                payload.get("max_search_rounds"),
+                self.settings.max_search_rounds,
+            ),
+            "max_web_results_per_query": _coerce_positive_int(
+                payload.get("max_web_results_per_query"),
+                self.settings.max_web_results_per_query,
+            ),
+            "max_paper_results_per_query": _coerce_positive_int(
+                payload.get("max_paper_results_per_query"),
+                self.settings.max_paper_results_per_query,
+            ),
+            "max_selected_sources": _coerce_positive_int(
+                payload.get("max_selected_sources"),
+                self.settings.max_selected_sources,
+            ),
+            "max_critic_results": _coerce_positive_int(
+                payload.get("max_critic_results"),
+                self.settings.max_critic_results,
+            ),
+            "max_chunks_per_source": _coerce_positive_int(
+                payload.get("max_chunks_per_source"),
+                self.settings.max_chunks_per_source,
+            ),
+        }
 
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = artifact_paths(output_dir, self.settings)["log"]
@@ -358,21 +456,36 @@ class GuiApp:
             topic=topic,
             output_dir=output_dir,
             answers=answers,
+            provider=provider,
             model=model,
+            api_base=api_base,
             max_summary_model_calls=max_summary_model_calls,
+            max_queries=knob_values["max_queries"],
+            max_total_queries=knob_values["max_total_queries"],
+            max_search_rounds=knob_values["max_search_rounds"],
+            max_web_results_per_query=knob_values["max_web_results_per_query"],
+            max_paper_results_per_query=knob_values["max_paper_results_per_query"],
+            max_selected_sources=knob_values["max_selected_sources"],
+            max_critic_results=knob_values["max_critic_results"],
+            max_chunks_per_source=knob_values["max_chunks_per_source"],
             no_clarify=no_clarify,
         )
+        env = os.environ.copy()
+        env.update(provider_api_env_overrides(provider, api_key, api_base))
         process = subprocess.Popen(
             command,
             cwd=str(self.launch_cwd),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
-            env=os.environ.copy(),
+            env=env,
         )
         log_handle.close()
         self.processes[str(output_dir)] = process
-        self.process_models[str(output_dir)] = model
+        self.process_providers[str(output_dir)] = provider
+        self.process_models[str(output_dir)] = (
+            f"{provider}/{model}" if model and not model.startswith(f"{provider}/") else model
+        )
         self.process_budgets[str(output_dir)] = max_summary_model_calls
         self._send_json(
             handler,
@@ -380,8 +493,10 @@ class GuiApp:
                 "started": True,
                 "pid": process.pid,
                 "output_dir": str(output_dir),
-                "model": model,
+                "provider": provider,
+                "model": self.process_models[str(output_dir)],
                 "max_summary_model_calls": max_summary_model_calls,
+                "knobs": knob_values,
                 "command": command,
             },
             status=HTTPStatus.ACCEPTED,
@@ -406,6 +521,7 @@ class GuiApp:
             process.kill()
             process.wait(timeout=5)
             stopped = True
+        self.process_providers.pop(str(output_dir), None)
         self.process_models.pop(str(output_dir), None)
         self.process_budgets.pop(str(output_dir), None)
         self._send_json(handler, {"stopped": stopped, "pid": process.pid})
@@ -501,9 +617,26 @@ class GuiApp:
 
     def render_index(self) -> str:
         default_output = str((self.output_root / "latest").resolve())
-        default_model = _escape_html(self.settings.ollama_model)
+        default_provider = self.settings.llm_provider
+        default_model_display = _escape_html(self.settings.model_display_name())
+        default_provider_model = _escape_html(self.settings.llm_model)
+        default_api_base_value = self.settings.llm_api_base or default_api_base(default_provider)
+        default_api_base_html = _escape_html(default_api_base_value)
         default_budget = str(self.settings.max_summary_model_calls)
-        model_options = _model_options_html(list_available_models(self.settings), self.settings.ollama_model)
+        default_max_queries = str(self.settings.max_queries)
+        default_max_total_queries = str(self.settings.max_total_queries)
+        default_max_search_rounds = str(self.settings.max_search_rounds)
+        default_max_web_results = str(self.settings.max_web_results_per_query)
+        default_max_paper_results = str(self.settings.max_paper_results_per_query)
+        default_max_selected_sources = str(self.settings.max_selected_sources)
+        default_max_critic_results = str(self.settings.max_critic_results)
+        default_max_chunks_per_source = str(self.settings.max_chunks_per_source)
+        provider_info = provider_metadata(default_provider)
+        provider_options = _provider_options_html(default_provider)
+        model_options = _model_options_html(
+            list_available_models(self.settings, default_provider),
+            self.settings.llm_model,
+        )
         return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -596,7 +729,7 @@ class GuiApp:
       color: var(--muted);
       letter-spacing: 0.02em;
     }}
-    input, textarea, select {{
+    input, textarea {{
       width: 100%;
       padding: 12px 14px;
       border-radius: 14px;
@@ -621,6 +754,21 @@ class GuiApp:
       font: 700 0.82rem/1 var(--font-display);
       letter-spacing: 0.04em;
       text-transform: uppercase;
+    }}
+    .knob-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid rgba(24,33,42,0.08);
+      background: rgba(255,255,255,0.56);
+    }}
+    .knob-grid label {{
+      gap: 4px;
+    }}
+    .knob-grid input {{
+      padding: 10px 12px;
     }}
     .actions {{
       display: flex;
@@ -817,15 +965,32 @@ class GuiApp:
           <label>Output Directory
             <input id="output-dir" name="output_dir" value="{_escape_html(default_output)}">
           </label>
+          <label>Provider
+            <input id="provider" name="provider" list="provider-options" value="{_escape_html(default_provider)}" placeholder="ollama, gemini, openai, nvidia_nim..." spellcheck="false" autocomplete="off">
+            <datalist id="provider-options">{provider_options}</datalist>
+          </label>
           <div class="model-row">
-            <label>Ollama Model
-              <select id="model" name="model">{model_options}</select>
+            <label>Model
+              <input id="model" name="model" list="model-options" value="{default_provider_model}" placeholder="Type any LiteLLM model name" spellcheck="false" autocomplete="off">
+              <datalist id="model-options">{model_options}</datalist>
+              <span class="small" id="model-hint">{_escape_html(str(provider_info.get("model_hint", "")))}</span>
             </label>
             <button class="secondary button-with-spinner" id="refresh-models-button" type="button">
               <span>Refresh Models</span>
               <span class="spinner hidden" id="refresh-models-spinner" aria-hidden="true"></span>
             </button>
           </div>
+          <label id="api-base-label">{_escape_html(str(provider_info.get("api_base_label", "API Base")))}
+            <input
+              id="api-base"
+              name="api_base"
+              value="{default_api_base_html}"
+              placeholder="{_escape_html(str(provider_info.get('api_base_placeholder', '')))}"
+            >
+          </label>
+          <label id="api-key-row"{" class=\"hidden\"" if not provider_info.get("requires_api_key") else ""}>{_escape_html(str(provider_info.get("api_key_label", "API Key")))}
+            <input id="api-key" name="api_key" type="password" placeholder="Used only for the launched subprocess; never written to run artifacts.">
+          </label>
           <label>Summary Budget
             <div class="inline" style="justify-content:space-between;">
               <span class="small">Max summary model calls</span>
@@ -833,6 +998,32 @@ class GuiApp:
             </div>
             <input id="max-summary-model-calls" name="max_summary_model_calls" type="range" min="4" max="48" step="1" value="{default_budget}">
           </label>
+          <div class="knob-grid">
+            <label>Seed Queries
+              <input id="max-queries" name="max_queries" type="number" min="1" step="1" value="{default_max_queries}">
+            </label>
+            <label>Total Queries
+              <input id="max-total-queries" name="max_total_queries" type="number" min="1" step="1" value="{default_max_total_queries}">
+            </label>
+            <label>Search Rounds
+              <input id="max-search-rounds" name="max_search_rounds" type="number" min="1" step="1" value="{default_max_search_rounds}">
+            </label>
+            <label>Selected Sources
+              <input id="max-selected-sources" name="max_selected_sources" type="number" min="1" step="1" value="{default_max_selected_sources}">
+            </label>
+            <label>Web Results / Query
+              <input id="max-web-results-per-query" name="max_web_results_per_query" type="number" min="1" step="1" value="{default_max_web_results}">
+            </label>
+            <label>Paper Results / Query
+              <input id="max-paper-results-per-query" name="max_paper_results_per_query" type="number" min="1" step="1" value="{default_max_paper_results}">
+            </label>
+            <label>Critic Shortlist
+              <input id="max-critic-results" name="max_critic_results" type="number" min="1" step="1" value="{default_max_critic_results}">
+            </label>
+            <label>Chunks / Source
+              <input id="max-chunks-per-source" name="max_chunks_per_source" type="number" min="1" step="1" value="{default_max_chunks_per_source}">
+            </label>
+          </div>
           <label>Objective
             <textarea id="objective" name="objective" placeholder="What exact question should the report answer?"></textarea>
           </label>
@@ -889,7 +1080,8 @@ class GuiApp:
           <div class="card">
             <h2>Run</h2>
             <div class="small inline"><strong>Stage:</strong> <span id="run-stage">-</span></div><br>
-            <div class="small inline"><strong>Model:</strong> <span id="run-model">{default_model}</span></div><br>
+            <div class="small inline"><strong>Provider:</strong> <span id="run-provider">{_escape_html(default_provider)}</span></div><br>
+            <div class="small inline"><strong>Model:</strong> <span id="run-model">{default_model_display}</span></div><br>
             <div class="small inline"><strong>PID:</strong> <span id="run-pid">-</span></div><br>
             <div class="small inline"><strong>Exit:</strong> <span id="run-exit">-</span></div><br>
             <div class="small inline"><strong>Budget:</strong> <span id="budget-summary">-</span></div><br>
@@ -950,9 +1142,25 @@ class GuiApp:
     const artifactLoading = document.getElementById('artifact-loading');
     const artifactLoadingLabel = document.getElementById('artifact-loading-label');
     const logView = document.getElementById('log-view');
-    const modelSelect = document.getElementById('model');
+    const providerInput = document.getElementById('provider');
+    const providerOptions = document.getElementById('provider-options');
+    const modelInput = document.getElementById('model');
+    const modelOptions = document.getElementById('model-options');
+    const modelHint = document.getElementById('model-hint');
+    const apiBaseLabel = document.getElementById('api-base-label');
+    const apiBaseInput = document.getElementById('api-base');
+    const apiKeyRow = document.getElementById('api-key-row');
+    const apiKeyInput = document.getElementById('api-key');
     const budgetSlider = document.getElementById('max-summary-model-calls');
     const budgetSliderValue = document.getElementById('budget-slider-value');
+    const maxQueriesInput = document.getElementById('max-queries');
+    const maxTotalQueriesInput = document.getElementById('max-total-queries');
+    const maxSearchRoundsInput = document.getElementById('max-search-rounds');
+    const maxSelectedSourcesInput = document.getElementById('max-selected-sources');
+    const maxWebResultsInput = document.getElementById('max-web-results-per-query');
+    const maxPaperResultsInput = document.getElementById('max-paper-results-per-query');
+    const maxCriticResultsInput = document.getElementById('max-critic-results');
+    const maxChunksPerSourceInput = document.getElementById('max-chunks-per-source');
     const startButton = document.getElementById('start-button');
     const startSpinner = document.getElementById('start-spinner');
     const refreshButton = document.getElementById('refresh-button');
@@ -964,6 +1172,7 @@ class GuiApp:
     const artifactButtons = Array.from(document.querySelectorAll('.artifact-button'));
     let currentOutputDir = document.getElementById('output-dir').value;
     let refreshInFlight = false;
+    let providerRefreshTimeout = null;
 
     function setSpinner(spinner, active) {{
       if (spinner) {{
@@ -990,34 +1199,70 @@ class GuiApp:
       }});
     }}
 
+    function populateProviderOptions(providers, selectedProvider) {{
+      const cleaned = Array.from(new Map(
+        (providers || []).map((item) => {{
+          const id = String(item?.id || item || '').trim();
+          const label = String(item?.label || id).trim();
+          return [id, {{ id, label }}];
+        }}).filter(([id]) => Boolean(id))
+      ).values());
+      providerOptions.innerHTML = '';
+      for (const provider of cleaned) {{
+        const option = document.createElement('option');
+        option.value = provider.id;
+        option.label = provider.label;
+        providerOptions.appendChild(option);
+      }}
+      if (selectedProvider) {{
+        providerInput.value = selectedProvider;
+      }}
+    }}
+
     function populateModelOptions(models, preferredModel) {{
       const cleaned = Array.from(new Set((models || []).map((item) => String(item || '').trim()).filter(Boolean)));
-      if (!cleaned.length) {{
-        modelSelect.innerHTML = '';
-        const option = document.createElement('option');
-        option.value = '';
-        option.textContent = 'No installed models found';
-        modelSelect.appendChild(option);
-        modelSelect.disabled = true;
-        return;
-      }}
-      modelSelect.disabled = false;
-      modelSelect.innerHTML = '';
+      modelOptions.innerHTML = '';
       for (const model of cleaned) {{
         const option = document.createElement('option');
         option.value = model;
-        option.textContent = model;
-        modelSelect.appendChild(option);
+        modelOptions.appendChild(option);
       }}
-      modelSelect.value = preferredModel && cleaned.includes(preferredModel) ? preferredModel : cleaned[0];
+      const fallback = String(preferredModel || '').trim() || modelInput.value.trim() || (cleaned[0] || '');
+      if (fallback) {{
+        modelInput.value = fallback;
+      }}
     }}
 
-    async function refreshModels(preferredModel = '') {{
+    function applyProviderMetadata(payload) {{
+      const provider = payload.provider || providerInput.value.trim() || 'ollama';
+      const apiBaseLabelText = payload.api_base_label || 'API Base';
+      const apiBasePlaceholder = payload.api_base_placeholder || '';
+      const apiKeyLabelText = payload.api_key_label || 'API Key';
+      const requiresApiKey = Boolean(payload.requires_api_key);
+
+      apiBaseLabel.childNodes[0].textContent = apiBaseLabelText;
+      apiBaseInput.placeholder = apiBasePlaceholder;
+      apiKeyRow.childNodes[0].textContent = apiKeyLabelText;
+      apiKeyRow.classList.toggle('hidden', !requiresApiKey);
+      modelHint.textContent = payload.model_hint || 'Suggestions come from LiteLLM. You can type any supported model manually.';
+
+      if (provider === 'ollama' && !apiBaseInput.value.trim()) {{
+        apiBaseInput.value = payload.default_api_base || '{default_api_base_html}';
+      }}
+      if (provider !== 'ollama' && apiBaseInput.value.trim() === '{default_api_base_html}') {{
+        apiBaseInput.value = payload.default_api_base || '';
+      }}
+    }}
+
+    async function refreshModels(preferredModel = '', preferredProvider = '') {{
       setButtonBusy(refreshModelsButton, refreshModelsSpinner, true);
       try {{
-        const response = await fetch('/api/models');
+        const provider = (preferredProvider || providerInput.value.trim() || '{default_provider}').toLowerCase();
+        const response = await fetch(`/api/models?provider=${{encodeURIComponent(provider)}}`);
         const payload = await response.json();
-        populateModelOptions(payload.models || [], preferredModel || modelSelect.value.trim());
+        populateProviderOptions(payload.providers || [], payload.provider || provider);
+        populateModelOptions(payload.models || [], preferredModel || modelInput.value.trim());
+        applyProviderMetadata(payload);
         if (payload.default_max_summary_model_calls) {{
           const value = String(payload.default_max_summary_model_calls);
           if (!budgetSlider.value) {{
@@ -1026,10 +1271,20 @@ class GuiApp:
           budgetSliderValue.textContent = budgetSlider.value;
         }}
       }} catch (_error) {{
-        populateModelOptions([], preferredModel || modelSelect.value.trim());
+        populateModelOptions([], preferredModel || modelInput.value.trim());
       }} finally {{
         setButtonBusy(refreshModelsButton, refreshModelsSpinner, false);
       }}
+    }}
+
+    function scheduleProviderRefresh() {{
+      if (providerRefreshTimeout) {{
+        window.clearTimeout(providerRefreshTimeout);
+      }}
+      providerRefreshTimeout = window.setTimeout(() => {{
+        providerRefreshTimeout = null;
+        refreshModels('', providerInput.value.trim());
+      }}, 180);
     }}
 
     function answerPayload() {{
@@ -1056,8 +1311,19 @@ class GuiApp:
             topic: document.getElementById('topic').value.trim(),
             output_dir: currentOutputDir,
             no_clarify: document.getElementById('no-clarify').checked,
-            model: document.getElementById('model').value.trim(),
+            provider: providerInput.value.trim(),
+            model: modelInput.value.trim(),
+            api_base: apiBaseInput.value.trim(),
+            api_key: apiKeyInput.value,
             max_summary_model_calls: Number(budgetSlider.value),
+            max_queries: Number(maxQueriesInput.value),
+            max_total_queries: Number(maxTotalQueriesInput.value),
+            max_search_rounds: Number(maxSearchRoundsInput.value),
+            max_selected_sources: Number(maxSelectedSourcesInput.value),
+            max_web_results_per_query: Number(maxWebResultsInput.value),
+            max_paper_results_per_query: Number(maxPaperResultsInput.value),
+            max_critic_results: Number(maxCriticResultsInput.value),
+            max_chunks_per_source: Number(maxChunksPerSourceInput.value),
             answers: answerPayload(),
           }}),
         }});
@@ -1105,7 +1371,8 @@ class GuiApp:
         const payload = await response.json();
         statusChipLabel.textContent = payload.status || 'idle';
         currentOutput.textContent = payload.output_dir || currentOutputDir;
-        document.getElementById('run-model').textContent = payload.model || document.getElementById('model').value.trim() || '-';
+        document.getElementById('run-provider').textContent = payload.provider || providerInput.value.trim() || '-';
+        document.getElementById('run-model').textContent = payload.model || modelInput.value.trim() || '-';
         document.getElementById('count-selected').textContent = payload.counts?.selected_sources ?? 0;
         document.getElementById('count-citations').textContent = payload.counts?.citations ?? 0;
         document.getElementById('count-notes').textContent = payload.counts?.source_notes ?? 0;
@@ -1177,7 +1444,10 @@ class GuiApp:
 
     form.addEventListener('submit', startRun);
     refreshButton.addEventListener('click', () => refreshStatus({{ manual: true }}));
-    refreshModelsButton.addEventListener('click', () => refreshModels(modelSelect.value.trim()));
+    refreshModelsButton.addEventListener('click', () => refreshModels(modelInput.value.trim(), providerInput.value.trim()));
+    providerInput.addEventListener('input', scheduleProviderRefresh);
+    providerInput.addEventListener('change', () => refreshModels('', providerInput.value.trim()));
+    providerInput.addEventListener('blur', () => refreshModels('', providerInput.value.trim()));
     stopButton.addEventListener('click', stopRun);
     budgetSlider.addEventListener('input', () => {{
       budgetSliderValue.textContent = budgetSlider.value;
@@ -1186,7 +1456,7 @@ class GuiApp:
       button.addEventListener('click', () => loadArtifact(button.dataset.artifact));
     }});
 
-    refreshModels();
+    refreshModels('{default_provider_model}', '{default_provider}');
     refreshStatus();
     setInterval(refreshStatus, 3000);
   </script>
@@ -1232,13 +1502,31 @@ def _escape_html(value: str) -> str:
     )
 
 
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _model_options_html(models: list[str], selected_model: str) -> str:
     options = []
-    if not models:
-        return '<option value="">No installed models found</option>'
     for model in models:
-        selected = ' selected' if model == selected_model else ''
+        if not model:
+            continue
+        options.append(f'<option value="{_escape_html(model)}"></option>')
+    if selected_model and selected_model not in models:
+        options.append(f'<option value="{_escape_html(selected_model)}"></option>')
+    return "".join(options)
+
+
+def _provider_options_html(selected_provider: str) -> str:
+    options: list[str] = []
+    for provider in provider_names():
+        label = str(provider_metadata(provider)["label"])
+        selected_attr = ' selected' if provider == selected_provider else ''
         options.append(
-            f'<option value="{_escape_html(model)}"{selected}>{_escape_html(model)}</option>'
+            f'<option value="{_escape_html(provider)}" label="{_escape_html(label)}"{selected_attr}></option>'
         )
     return "".join(options)

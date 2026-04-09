@@ -4,6 +4,8 @@ import json
 
 from deep_research_ollama.schemas import (
     clarifier_schema,
+    collaboration_session_schema,
+    collaboration_turn_schema,
     planner_schema,
     relevance_critic_schema,
     retrieval_strategy_schema,
@@ -234,6 +236,7 @@ def writer_prompt(
     source_requirements: list[str],
     answers: dict[str, str],
     constitution_snapshot: dict,
+    collaboration_snapshot: dict,
     source_notes: list[dict],
     citations: list[dict],
     program: str,
@@ -245,6 +248,7 @@ def writer_prompt(
         (
             "You are WriterAgent for a research assistant. "
             "Produce a structured synthesis using only the provided evidence. "
+            "Treat the collaboration transcript as an internal debate record: keep supported consensus, surface disputes honestly, and do not overstate challenged claims. "
             "Do not invent citation keys. "
             "If evidence is weak or contradictory, say so in notes instead of overstating certainty. "
             "Return valid JSON that matches this schema exactly. "
@@ -262,6 +266,78 @@ def writer_prompt(
         f"Source requirements: {json.dumps(source_requirements, ensure_ascii=True)}\n"
         f"Clarifications: {json.dumps(answers, ensure_ascii=True)}\n"
         f"Constitution snapshot: {json.dumps(constitution_snapshot, ensure_ascii=True)}\n"
+        f"Collaboration snapshot: {json.dumps(collaboration_snapshot, ensure_ascii=True)}\n"
+        f"Source notes: {json.dumps(source_notes, ensure_ascii=True)}\n"
+        f"Citations: {json.dumps(citations, ensure_ascii=True)}"
+    )
+    return system, user
+
+
+def collaboration_worker_prompt(
+    *,
+    role_name: str,
+    role_instruction: str,
+    topic: str,
+    rewritten_question: str,
+    answers: dict[str, str],
+    prior_turns: list[dict],
+    source_notes: list[dict],
+    citations: list[dict],
+    program: str,
+) -> tuple[str, str]:
+    citation_keys = [str(item.get("cite_key", "")).strip() for item in citations]
+    schema = collaboration_turn_schema(citation_keys)
+    system = _system_prompt(
+        program,
+        (
+            f"You are {role_name}. "
+            f"{role_instruction} "
+            "You are collaborating with other worker agents on the same source set. "
+            "React to prior turns directly, refute weak claims when needed, and send concise messages to the next worker. "
+            "Return valid JSON that matches this schema exactly. "
+            "Use only provided citation keys from the schema enum for claim citation_keys. "
+            f"{schema_text(schema)}."
+        ),
+    )
+    user = (
+        f"Topic: {topic}\n"
+        f"Rewritten question: {rewritten_question}\n"
+        f"Clarifications: {json.dumps(answers, ensure_ascii=True)}\n"
+        f"Prior turns: {json.dumps(prior_turns, ensure_ascii=True)}\n"
+        f"Source notes: {json.dumps(source_notes, ensure_ascii=True)}\n"
+        f"Citations: {json.dumps(citations, ensure_ascii=True)}"
+    )
+    return system, user
+
+
+def collaboration_coordinator_prompt(
+    *,
+    topic: str,
+    rewritten_question: str,
+    answers: dict[str, str],
+    turns: list[dict],
+    source_notes: list[dict],
+    citations: list[dict],
+    program: str,
+) -> tuple[str, str]:
+    citation_keys = [str(item.get("cite_key", "")).strip() for item in citations]
+    schema = collaboration_session_schema(citation_keys)
+    system = _system_prompt(
+        program,
+        (
+            "You are ChairAgent. "
+            "Review the worker debate, keep only claims that survive scrutiny, preserve honest disputes, "
+            "and summarize what still needs caution. "
+            "Return valid JSON that matches this schema exactly. "
+            "Use only provided citation keys from the schema enum for consensus_claims citation_keys. "
+            f"{schema_text(schema)}."
+        ),
+    )
+    user = (
+        f"Topic: {topic}\n"
+        f"Rewritten question: {rewritten_question}\n"
+        f"Clarifications: {json.dumps(answers, ensure_ascii=True)}\n"
+        f"Worker turns: {json.dumps(turns, ensure_ascii=True)}\n"
         f"Source notes: {json.dumps(source_notes, ensure_ascii=True)}\n"
         f"Citations: {json.dumps(citations, ensure_ascii=True)}"
     )

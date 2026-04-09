@@ -59,10 +59,10 @@ class GuiTests(unittest.TestCase):
 
             self.assertEqual(models, ["gemma4:e4b", "openai/gpt-oss:20b"])
 
-    def test_model_options_html_does_not_inject_missing_default(self) -> None:
+    def test_model_options_html_keeps_current_manual_value(self) -> None:
         html = _model_options_html(["gemma4:e4b", "qwen3:14b"], "llama3.1")
 
-        self.assertNotIn("llama3.1", html)
+        self.assertIn("llama3.1", html)
         self.assertIn("gemma4:e4b", html)
         self.assertIn("qwen3:14b", html)
 
@@ -74,8 +74,18 @@ class GuiTests(unittest.TestCase):
                 "objective": "compare theorem proving systems",
                 "audience": "researchers",
             },
+            provider="gemini",
             model="gemma4:e4b",
+            api_base="https://example.com",
             max_summary_model_calls=12,
+            max_queries=7,
+            max_total_queries=18,
+            max_search_rounds=4,
+            max_web_results_per_query=6,
+            max_paper_results_per_query=5,
+            max_selected_sources=10,
+            max_critic_results=20,
+            max_chunks_per_source=8,
             no_clarify=True,
         )
 
@@ -83,10 +93,30 @@ class GuiTests(unittest.TestCase):
         self.assertIn("AI for mathematics", command)
         self.assertIn("--output-dir", command)
         self.assertIn("/tmp/gui-run", command)
+        self.assertIn("--provider", command)
+        self.assertIn("gemini", command)
         self.assertIn("--model", command)
         self.assertIn("gemma4:e4b", command)
+        self.assertIn("--api-base", command)
+        self.assertIn("https://example.com", command)
         self.assertIn("--max-summary-model-calls", command)
         self.assertIn("12", command)
+        self.assertIn("--max-queries", command)
+        self.assertIn("7", command)
+        self.assertIn("--max-total-queries", command)
+        self.assertIn("18", command)
+        self.assertIn("--max-search-rounds", command)
+        self.assertIn("4", command)
+        self.assertIn("--max-web-results-per-query", command)
+        self.assertIn("6", command)
+        self.assertIn("--max-paper-results-per-query", command)
+        self.assertIn("5", command)
+        self.assertIn("--max-selected-sources", command)
+        self.assertIn("10", command)
+        self.assertIn("--max-critic-results", command)
+        self.assertIn("20", command)
+        self.assertIn("--max-chunks-per-source", command)
+        self.assertIn("8", command)
         self.assertIn("--no-clarify", command)
         self.assertIn("--answer", command)
         self.assertIn("objective=compare theorem proving systems", command)
@@ -165,11 +195,13 @@ class GuiTests(unittest.TestCase):
                 output_dir=output_dir,
                 settings=settings,
                 process=_RunningProcess(),
+                process_provider="gemini",
                 process_model="gemma4:e4b",
                 process_budget=11,
             )
 
             self.assertEqual(status["status"], "running:starting")
+            self.assertEqual(status["provider"], "gemini")
             self.assertEqual(status["model"], "gemma4:e4b")
             self.assertEqual(status["budget"]["max_summary_model_calls"], 11)
 
@@ -187,13 +219,32 @@ class GuiTests(unittest.TestCase):
             self.assertIn("/artifact-file?output_dir=", payload["viewer_url"])
             self.assertIn("name=pdf", payload["viewer_url"])
 
-    def test_render_index_uses_select_for_models(self) -> None:
-        app = GuiApp(Settings(ollama_model="gemma4:e4b"), output_root=Path("/tmp"), launch_cwd=Path("/tmp"))
+    def test_render_index_uses_datalists_for_provider_and_model(self) -> None:
+        app = GuiApp(
+            Settings(llm_provider="ollama", llm_model="gemma4:e4b"),
+            output_root=Path("/tmp"),
+            launch_cwd=Path("/tmp"),
+        )
 
         html = app.render_index()
 
-        self.assertIn('<select id="model"', html)
+        self.assertIn('<input id="provider"', html)
+        self.assertIn('list="provider-options"', html)
+        self.assertIn('<datalist id="provider-options">', html)
+        self.assertIn('<input id="model"', html)
+        self.assertIn('list="model-options"', html)
+        self.assertIn('<datalist id="model-options">', html)
+        self.assertIn("Google Gemini", html)
         self.assertIn("Refresh Models", html)
+        self.assertIn("Type any LiteLLM model name", html)
+        self.assertIn('id="max-queries"', html)
+        self.assertIn('id="max-total-queries"', html)
+        self.assertIn('id="max-search-rounds"', html)
+        self.assertIn('id="max-selected-sources"', html)
+        self.assertIn('id="max-web-results-per-query"', html)
+        self.assertIn('id="max-paper-results-per-query"', html)
+        self.assertIn('id="max-critic-results"', html)
+        self.assertIn('id="max-chunks-per-source"', html)
         self.assertIn('id="max-summary-model-calls"', html)
         self.assertIn('id="start-spinner"', html)
         self.assertIn('id="status-spinner"', html)
@@ -210,10 +261,30 @@ class GuiTests(unittest.TestCase):
                 "9000",
                 "--output-root",
                 "/tmp/deep-research-gui",
+                "--provider",
+                "gemini",
                 "--model",
-                "gemma4:e4b",
+                "gemini-2.5-flash",
+                "--api-base",
+                "https://example.com",
                 "--max-summary-model-calls",
                 "24",
+                "--max-queries",
+                "7",
+                "--max-total-queries",
+                "18",
+                "--max-search-rounds",
+                "4",
+                "--max-web-results-per-query",
+                "6",
+                "--max-paper-results-per-query",
+                "5",
+                "--max-selected-sources",
+                "10",
+                "--max-critic-results",
+                "20",
+                "--max-chunks-per-source",
+                "8",
                 "--open-browser",
             ]
         )
@@ -222,8 +293,18 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(args.host, "0.0.0.0")
         self.assertEqual(args.port, 9000)
         self.assertEqual(args.output_root, "/tmp/deep-research-gui")
-        self.assertEqual(args.model, "gemma4:e4b")
+        self.assertEqual(args.provider, "gemini")
+        self.assertEqual(args.model, "gemini-2.5-flash")
+        self.assertEqual(args.api_base, "https://example.com")
         self.assertEqual(args.max_summary_model_calls, 24)
+        self.assertEqual(args.max_queries, 7)
+        self.assertEqual(args.max_total_queries, 18)
+        self.assertEqual(args.max_search_rounds, 4)
+        self.assertEqual(args.max_web_results_per_query, 6)
+        self.assertEqual(args.max_paper_results_per_query, 5)
+        self.assertEqual(args.max_selected_sources, 10)
+        self.assertEqual(args.max_critic_results, 20)
+        self.assertEqual(args.max_chunks_per_source, 8)
         self.assertTrue(args.open_browser)
 
     def test_main_dispatches_gui_command(self) -> None:
@@ -240,10 +321,30 @@ class GuiTests(unittest.TestCase):
                     "8765",
                     "--output-root",
                     "/tmp/gui-output",
+                    "--provider",
+                    "gemini",
                     "--model",
-                    "gemma4:e4b",
+                    "gemini-2.5-flash",
+                    "--api-base",
+                    "https://example.com",
                     "--max-summary-model-calls",
                     "24",
+                    "--max-queries",
+                    "7",
+                    "--max-total-queries",
+                    "18",
+                    "--max-search-rounds",
+                    "4",
+                    "--max-web-results-per-query",
+                    "6",
+                    "--max-paper-results-per-query",
+                    "5",
+                    "--max-selected-sources",
+                    "10",
+                    "--max-critic-results",
+                    "20",
+                    "--max-chunks-per-source",
+                    "8",
                 ],
             ):
                 main()
@@ -255,8 +356,18 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(kwargs["port"], 8765)
         self.assertEqual(kwargs["output_root"], Path("/tmp/gui-output").resolve())
         self.assertFalse(kwargs["open_browser"])
-        self.assertEqual(settings.ollama_model, "gemma4:e4b")
+        self.assertEqual(settings.llm_provider, "gemini")
+        self.assertEqual(settings.llm_model, "gemini-2.5-flash")
+        self.assertEqual(settings.llm_api_base, "https://example.com")
         self.assertEqual(settings.max_summary_model_calls, 24)
+        self.assertEqual(settings.max_queries, 7)
+        self.assertEqual(settings.max_total_queries, 18)
+        self.assertEqual(settings.max_search_rounds, 4)
+        self.assertEqual(settings.max_web_results_per_query, 6)
+        self.assertEqual(settings.max_paper_results_per_query, 5)
+        self.assertEqual(settings.max_selected_sources, 10)
+        self.assertEqual(settings.max_critic_results, 20)
+        self.assertEqual(settings.max_chunks_per_source, 8)
 
     def test_main_run_applies_model_override(self) -> None:
         with patch("deep_research_ollama.cli.ResearchPipeline") as mock_pipeline_cls:
@@ -274,18 +385,48 @@ class GuiTests(unittest.TestCase):
                         "--output-dir",
                         "/tmp/gui-run",
                         "--no-clarify",
+                        "--provider",
+                        "gemini",
                         "--model",
-                        "qwen3:14b",
+                        "gemini-2.5-flash",
+                        "--api-base",
+                        "https://example.com",
                         "--max-summary-model-calls",
                         "9",
+                        "--max-queries",
+                        "7",
+                        "--max-total-queries",
+                        "18",
+                        "--max-search-rounds",
+                        "4",
+                        "--max-web-results-per-query",
+                        "6",
+                        "--max-paper-results-per-query",
+                        "5",
+                        "--max-selected-sources",
+                        "10",
+                        "--max-critic-results",
+                        "20",
+                        "--max-chunks-per-source",
+                        "8",
                     ],
                 ),
             ):
                 main()
 
         settings = mock_pipeline_cls.call_args[0][0]
-        self.assertEqual(settings.ollama_model, "qwen3:14b")
+        self.assertEqual(settings.llm_provider, "gemini")
+        self.assertEqual(settings.llm_model, "gemini-2.5-flash")
+        self.assertEqual(settings.llm_api_base, "https://example.com")
         self.assertEqual(settings.max_summary_model_calls, 9)
+        self.assertEqual(settings.max_queries, 7)
+        self.assertEqual(settings.max_total_queries, 18)
+        self.assertEqual(settings.max_search_rounds, 4)
+        self.assertEqual(settings.max_web_results_per_query, 6)
+        self.assertEqual(settings.max_paper_results_per_query, 5)
+        self.assertEqual(settings.max_selected_sources, 10)
+        self.assertEqual(settings.max_critic_results, 20)
+        self.assertEqual(settings.max_chunks_per_source, 8)
 
 
 if __name__ == "__main__":

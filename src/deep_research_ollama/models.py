@@ -155,3 +155,34 @@ class SynthesisResult:
             "delete_citation_keys": list(self.delete_citation_keys),
             "delete_finding_ids": list(self.delete_finding_ids),
         }
+
+
+@dataclass
+class CollaborationTurn:
+    role: str
+    summary: str
+    claims: list[dict[str, Any]] = field(default_factory=list)
+    criticisms: list[str] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+    messages_to_next: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CollaborationSession:
+    turns: list[CollaborationTurn] = field(default_factory=list)
+    consensus_claims: list[dict[str, Any]] = field(default_factory=list)
+    disputed_claims: list[str] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+    coordinator_notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turns": [turn.to_dict() for turn in self.turns],
+            "consensus_claims": list(self.consensus_claims),
+            "disputed_claims": list(self.disputed_claims),
+            "open_questions": list(self.open_questions),
+            "coordinator_notes": list(self.coordinator_notes),
+        }
