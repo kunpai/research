@@ -25,7 +25,7 @@ class Settings:
     min_papers: int = 2
     min_web_sources: int = 1
     max_sources_per_backend: int = 3
-    max_critic_results: int = 16
+    max_critic_results: int = 0
     max_summary_model_calls: int = 18
     chunk_chars: int = 5500
     chunk_overlap_chars: int = 500
@@ -45,6 +45,7 @@ class Settings:
     google_cse_id: str | None = None
     serpapi_api_key: str | None = None
     semantic_scholar_api_key: str | None = None
+    enable_google_scholar: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -147,6 +148,8 @@ class Settings:
             google_cse_id=os.getenv("GOOGLE_CSE_ID"),
             serpapi_api_key=os.getenv("SERPAPI_API_KEY"),
             semantic_scholar_api_key=os.getenv("SEMANTIC_SCHOLAR_API_KEY"),
+            enable_google_scholar=os.getenv("ENABLE_GOOGLE_SCHOLAR", "1").strip().lower()
+            not in {"0", "false", "no", "off"},
         )
 
     @property

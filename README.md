@@ -37,7 +37,7 @@ Current state is a strong prototype:
 Still true:
 
 - broad topics are weaker than narrow technical topics
-- Google Scholar is not integrated directly
+- Google Scholar is best-effort, not an official API integration
 - worker roles are sequential, not real parallel workers
 
 ## Architecture
@@ -198,6 +198,7 @@ It currently supports:
 - provider input with suggestions
 - model input with suggestions
 - API key input for remote providers
+- optional SerpAPI and Semantic Scholar keys for retrieval
 - API base override
 - start / stop / resume
 - PDF rendering in the artifact viewer
@@ -306,6 +307,7 @@ export GOOGLE_API_KEY=
 export GOOGLE_CSE_ID=
 export SERPAPI_API_KEY=
 export SEMANTIC_SCHOLAR_API_KEY=
+export ENABLE_GOOGLE_SCHOLAR=1
 ```
 
 Common provider-specific keys the app understands include:
@@ -320,7 +322,13 @@ Common provider-specific keys the app understands include:
 - `MISTRAL_API_KEY`
 - `COHERE_API_KEY`
 
-If Google CSE and SerpAPI are not configured, web search falls back to DuckDuckGo HTML.
+Search behavior:
+
+- Google Scholar is queried as a paper backend on every run unless `ENABLE_GOOGLE_SCHOLAR=0`.
+- with `SERPAPI_API_KEY`, Scholar uses SerpAPI's `google_scholar` engine first
+- without SerpAPI, it falls back to direct Google Scholar HTML parsing
+- if Google CSE and SerpAPI are not configured, general web search falls back to DuckDuckGo HTML
+- Scholar hits carry cited-by counts and Scholar citation-export URLs, and citation resolution can use Scholar BibTeX when Crossref misses
 
 ## CLI Usage
 
@@ -430,7 +438,7 @@ The client asks LiteLLM providers for structured responses when supported and va
 - the collaborative roles are not true parallel workers
 - retrieval still admits weak web sources on broad topics
 - Crossref can still be noisy on ambiguous titles
-- Google Scholar is not integrated directly
+- direct Google Scholar parsing is best-effort and may degrade under bot checks or markup changes
 - search quality still depends heavily on query ambiguity and source availability
 - the writer can still fall back to source-note compilation if the chosen model is weak or times out
 

@@ -19,6 +19,8 @@ class SearchResult:
     abstract: str = ""
     citation_count: int = 0
     matched_queries: list[str] = field(default_factory=list)
+    scholar_id: str = ""
+    scholar_cite_url: str = ""
     critic_relevant: bool | None = None
     critic_reason: str = ""
     critic_query: str = ""
@@ -38,6 +40,8 @@ class SourceDocument:
     year: str = ""
     doi: str = ""
     arxiv_id: str = ""
+    scholar_id: str = ""
+    scholar_cite_url: str = ""
     abstract: str = ""
     text: str = ""
     text_chunks: list[str] = field(default_factory=list)

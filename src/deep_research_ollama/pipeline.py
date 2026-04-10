@@ -36,7 +36,9 @@ from deep_research_ollama.prompts import (
     collaboration_worker_prompt,
     merge_source_prompt,
     planner_prompt,
+    relevance_critic_fallback_prompt,
     relevance_critic_prompt,
+    relevance_critic_single_fallback_prompt,
     retrieval_strategy_prompt,
     writer_prompt,
 )
@@ -1016,10 +1018,14 @@ class ResearchPipeline:
         answers: dict[str, str],
         results: list[SearchResult],
     ) -> list[SearchResult]:
-        if not results or self.settings.max_critic_results <= 0:
+        if not results:
             return results
 
-        limit = min(len(results), self.settings.max_critic_results)
+        limit = (
+            len(results)
+            if self.settings.max_critic_results <= 0
+            else min(len(results), self.settings.max_critic_results)
+        )
         candidates: list[dict[str, str]] = []
         for result in results[:limit]:
             query = next(
@@ -1062,36 +1068,16 @@ class ResearchPipeline:
         if cache_key in self._relevance_critic_cache:
             judgments_by_id = self._relevance_critic_cache[cache_key]
         else:
-            system, user = relevance_critic_prompt(
+            query_by_id = {candidate["result_id"]: candidate["query"] for candidate in candidates}
+            judgments_by_id = self._run_relevance_critic(
                 topic,
-                plan.rewritten_question,
+                plan,
                 answers,
                 candidates,
-                self.program,
+                query_by_id,
             )
-            try:
-                payload = self.ollama.chat_json(
-                    system,
-                    user,
-                    schema=relevance_critic_schema(
-                        [candidate["result_id"] for candidate in candidates]
-                    ),
-                )
-            except OllamaError:
+            if not judgments_by_id:
                 return results
-            judgments_by_id = {}
-            query_by_id = {candidate["result_id"]: candidate["query"] for candidate in candidates}
-            for item in payload.get("judgments", []):
-                if not isinstance(item, dict):
-                    continue
-                result_id = str(item.get("result_id", "")).strip()
-                if not result_id:
-                    continue
-                judgments_by_id[result_id] = {
-                    "relevant": bool(item.get("relevant", False)),
-                    "reason": str(item.get("reason", "")).strip(),
-                    "query": query_by_id.get(result_id, ""),
-                }
             self._relevance_critic_cache[cache_key] = judgments_by_id
 
         for result in results:
@@ -1103,6 +1089,183 @@ class ResearchPipeline:
             result.critic_query = str(judgment.get("query", "")).strip()
 
         return results
+
+    def _run_relevance_critic(
+        self,
+        topic: str,
+        plan: ResearchPlan,
+        answers: dict[str, str],
+        candidates: list[dict[str, str]],
+        query_by_id: dict[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        candidate_ids = [candidate["result_id"] for candidate in candidates]
+        system, user = relevance_critic_prompt(
+            topic,
+            plan.rewritten_question,
+            answers,
+            candidates,
+            self.program,
+        )
+        try:
+            payload = self.ollama.chat_json(
+                system,
+                user,
+                schema=relevance_critic_schema(candidate_ids),
+            )
+        except OllamaError:
+            return self._fallback_relevance_critic(
+                topic,
+                plan,
+                answers,
+                candidates,
+                query_by_id,
+            )
+        return self._coerce_relevance_judgments(payload.get("judgments", []), query_by_id)
+
+    def _fallback_relevance_critic(
+        self,
+        topic: str,
+        plan: ResearchPlan,
+        answers: dict[str, str],
+        candidates: list[dict[str, str]],
+        query_by_id: dict[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        chat_text = getattr(self.ollama, "chat_text", None)
+        if not callable(chat_text):
+            return {}
+
+        judgments_by_id: dict[str, dict[str, Any]] = {}
+        system, user = relevance_critic_fallback_prompt(
+            topic,
+            plan.rewritten_question,
+            answers,
+            candidates,
+            self.program,
+        )
+        try:
+            raw = chat_text(system, user, temperature=0.0)
+        except OllamaError:
+            raw = ""
+        judgments_by_id.update(
+            self._parse_relevance_fallback_lines(raw, query_by_id)
+        )
+
+        if len(judgments_by_id) == len(candidates):
+            return judgments_by_id
+
+        for candidate in candidates:
+            result_id = candidate["result_id"]
+            if result_id in judgments_by_id:
+                continue
+            system, user = relevance_critic_single_fallback_prompt(
+                topic,
+                plan.rewritten_question,
+                answers,
+                candidate,
+                self.program,
+            )
+            try:
+                raw = chat_text(system, user, temperature=0.0)
+            except OllamaError:
+                continue
+            single = self._parse_single_relevance_fallback_line(
+                raw,
+                result_id,
+                query_by_id.get(result_id, ""),
+            )
+            if single:
+                judgments_by_id[result_id] = single
+
+        return judgments_by_id
+
+    @staticmethod
+    def _coerce_relevance_judgments(
+        items: list[Any],
+        query_by_id: dict[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        judgments_by_id: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            result_id = str(item.get("result_id", "")).strip()
+            if not result_id:
+                continue
+            judgments_by_id[result_id] = {
+                "relevant": bool(item.get("relevant", False)),
+                "reason": str(item.get("reason", "")).strip(),
+                "query": query_by_id.get(result_id, ""),
+            }
+        return judgments_by_id
+
+    @staticmethod
+    def _parse_relevance_fallback_lines(
+        raw: str,
+        query_by_id: dict[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        judgments_by_id: dict[str, dict[str, Any]] = {}
+        valid_ids = set(query_by_id)
+        for line in raw.splitlines():
+            item = ResearchPipeline._parse_relevance_batch_line(line, valid_ids)
+            if not item:
+                continue
+            result_id, relevant, reason = item
+            judgments_by_id[result_id] = {
+                "relevant": relevant,
+                "reason": reason,
+                "query": query_by_id.get(result_id, ""),
+            }
+        return judgments_by_id
+
+    @staticmethod
+    def _parse_relevance_batch_line(
+        line: str,
+        valid_ids: set[str],
+    ) -> tuple[str, bool, str] | None:
+        item = line.strip()
+        if not item:
+            return None
+        item = re.sub(r"^(?:[-*]\s*|\d+[\).\s]+)", "", item)
+        parts = [part.strip().strip('"') for part in re.split(r"\t+", item, maxsplit=2)]
+        if len(parts) < 2:
+            return None
+        result_id = parts[0]
+        if result_id not in valid_ids:
+            return None
+        verdict = ResearchPipeline._parse_relevance_verdict(parts[1])
+        if verdict is None:
+            return None
+        reason = parts[2].strip() if len(parts) > 2 else ""
+        return result_id, verdict, reason
+
+    @staticmethod
+    def _parse_single_relevance_fallback_line(
+        raw: str,
+        result_id: str,
+        query: str,
+    ) -> dict[str, Any] | None:
+        for line in raw.splitlines():
+            item = line.strip()
+            if not item:
+                continue
+            item = re.sub(r"^(?:[-*]\s*|\d+[\).\s]+)", "", item)
+            parts = [part.strip().strip('"') for part in re.split(r"\t+", item, maxsplit=1)]
+            if not parts:
+                continue
+            verdict = ResearchPipeline._parse_relevance_verdict(parts[0])
+            if verdict is None:
+                continue
+            reason = parts[1].strip() if len(parts) > 1 else ""
+            return {"relevant": verdict, "reason": reason, "query": query}
+        return None
+
+    @staticmethod
+    def _parse_relevance_verdict(value: str) -> bool | None:
+        normalized = value.strip().lower()
+        if normalized in {"yes", "y", "true", "relevant"}:
+            return True
+        if normalized in {"no", "n", "false", "irrelevant"}:
+            return False
+        return None
 
     def resolve_citations(
         self, documents: list[SourceDocument], constitution: dict[str, Any]
@@ -1399,7 +1562,7 @@ class ResearchPipeline:
             "\n\n".join(
                 self._sanitize_bibtex_entry(citation.bibtex).strip()
                 for citation in citations
-                if citation.bibtex
+                if citation.bibtex and CitationResolver.is_valid_bibtex(citation.bibtex)
             ).strip()
             + ("\n" if citations else ""),
             encoding="utf-8",
@@ -1482,6 +1645,7 @@ class ResearchPipeline:
                     self._sanitize_bibtex_entry(citation.bibtex).strip()
                     for citation in citations
                     if citation.bibtex
+                    and CitationResolver.is_valid_bibtex(citation.bibtex)
                 ).strip()
                 + ("\n" if citations else ""),
                 encoding="utf-8",
@@ -1999,14 +2163,7 @@ class ResearchPipeline:
 
     @staticmethod
     def _dedupe_results_by_id(results: list[SearchResult]) -> list[SearchResult]:
-        seen: set[str] = set()
-        ordered: list[SearchResult] = []
-        for result in results:
-            if result.result_id in seen:
-                continue
-            seen.add(result.result_id)
-            ordered.append(result)
-        return ordered
+        return SearchToolkit._dedupe_results(results)
 
     def _build_shortlist(self, ranked_results: list[SearchResult]) -> list[SearchResult]:
         shortlist_target = min(
@@ -2044,6 +2201,9 @@ class ResearchPipeline:
         answers: dict[str, str],
         ranked_results: list[SearchResult],
     ) -> list[SearchResult]:
+        ranked_results = self._dedupe_results_by_id(
+            self._critic_filtered_results(ranked_results)
+        )
         selected: list[SearchResult] = []
         selected_ids: set[str] = set()
         backend_counts: Counter[str] = Counter()
@@ -2098,6 +2258,16 @@ class ResearchPipeline:
             uncovered_terms.difference_update(self._result_terms(best_result))
 
         return self._ensure_source_diversity(ranked_results, selected)
+
+    @staticmethod
+    def _critic_filtered_results(results: list[SearchResult]) -> list[SearchResult]:
+        if not results:
+            return []
+
+        eligible = [result for result in results if result.critic_relevant is not False]
+        if eligible:
+            return eligible
+        return results
 
     def _incremental_selection_score(
         self,
@@ -2812,6 +2982,7 @@ class ResearchPipeline:
         backend_bonus = {
             "semantic_scholar": 7,
             "arxiv": 6,
+            "google_scholar": 5,
             "crossref": 2,
             "google_cse": 1,
             "serpapi": 1,
@@ -2839,6 +3010,7 @@ class ResearchPipeline:
         if self._covers_multiple_anchor_groups(topic, plan, answers, result):
             score += 8
 
+        score -= self._core_topic_mismatch_penalty(topic, plan, answers, result)
         score -= self._generic_page_penalty(topic, plan, answers, result)
         score -= self._thin_result_penalty(result)
         return (score, anchor_hits, query_hits, specific_title_overlap)
@@ -2892,8 +3064,9 @@ class ResearchPipeline:
         secondary_terms = self._ordered_terms(" ".join(secondary_texts))
         context_terms = self._dedupe_preserve_order(primary_terms + secondary_terms)
         topic_terms = self._ordered_terms(topic)
+        topic_special_terms = self._ordered_special_terms([topic])
         core_terms = self._dedupe_preserve_order(
-            self._ordered_special_terms([topic]) + special_terms + topic_terms + primary_terms + secondary_terms
+            topic_special_terms + topic_terms + primary_terms
         )[:6]
         platform_terms = [term for term in special_terms if any(char.isdigit() for char in term)]
         domain_terms = [
@@ -2909,6 +3082,9 @@ class ResearchPipeline:
 
         if core_terms:
             add(" ".join(core_terms))
+            if domain_terms:
+                add(" ".join(self._dedupe_preserve_order(core_terms[:3] + domain_terms[:4])))
+                add(" ".join(domain_terms[:4]))
             add(" ".join(core_terms[:4]) + " survey")
             add(" ".join(core_terms[:4]) + " review")
             add(" ".join(core_terms[:4]) + " benchmark")
@@ -3045,6 +3221,24 @@ class ResearchPipeline:
         filtered_special = [term for term in special if term not in generic_terms]
         return self._dedupe_preserve_order(filtered_special + phrase_terms + filtered_ordered[:18])
 
+    def _core_topic_terms(
+        self,
+        topic: str,
+        plan: ResearchPlan,
+        answers: dict[str, str],
+    ) -> list[str]:
+        strategy = self._get_retrieval_strategy(topic, plan, answers)
+        generic_terms = set(strategy.generic_terms)
+        ordered_topic_terms = [
+            term for term in self._ordered_terms(topic) if term not in generic_terms
+        ]
+        special_topic_terms = [
+            term
+            for term in self._ordered_special_terms([topic])
+            if term not in generic_terms
+        ]
+        return self._dedupe_preserve_order(special_topic_terms + ordered_topic_terms)[:6]
+
     def _domain_anchor_phrases(
         self,
         topic: str,
@@ -3110,6 +3304,34 @@ class ResearchPipeline:
         if result.kind == "web" and overlap > 0 and specific_overlap == 0:
             penalty += 4
         return penalty
+
+    def _core_topic_mismatch_penalty(
+        self,
+        topic: str,
+        plan: ResearchPlan,
+        answers: dict[str, str],
+        result: SearchResult,
+    ) -> int:
+        core_terms = self._core_topic_terms(topic, plan, answers)
+        if not core_terms:
+            return 0
+        result_terms = self._result_terms(result)
+        overlap = len(set(core_terms) & result_terms)
+        if len(core_terms) >= 3:
+            if overlap == 0:
+                return 18
+            if overlap == 1:
+                return 10
+            return 0
+        if len(core_terms) == 2:
+            if overlap == 0:
+                return 14
+            if overlap == 1:
+                return 6
+            return 0
+        if overlap == 0:
+            return 8
+        return 0
 
     @staticmethod
     def _thin_result_penalty(result: SearchResult) -> int:
@@ -3205,6 +3427,7 @@ class ResearchPipeline:
             "extension",
             "extensions",
             "feasibility",
+            "find",
             "focus",
             "for",
             "generic",

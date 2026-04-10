@@ -82,6 +82,63 @@ class CitationResolverTests(unittest.TestCase):
 
         self.assertEqual(updated, "@article{2024example, title={Example}}")
 
+    def test_resolve_uses_google_scholar_bibtex_when_crossref_missing(self) -> None:
+        resolver = self.make_resolver()
+        source = SourceDocument(
+            source_id="google_scholar:abc123",
+            title="Large language models for time series: A survey",
+            url="https://arxiv.org/abs/2402.01801",
+            kind="paper",
+            backend="google_scholar",
+            authors=["X Zhang"],
+            year="2024",
+            scholar_id="abc123",
+            scholar_cite_url="https://scholar.google.com/scholar?q=info%3Aabc123%3Ascholar.google.com%2F&output=cite",
+        )
+        resolver._fetch_bibtex_for_doi = lambda doi: ""  # type: ignore[method-assign]
+        resolver._get_text = lambda url, headers=None: (  # type: ignore[method-assign]
+            '<div id="gs_citi"><a class="gs_citi" href="https://scholar.googleusercontent.com/scholar.bib?q=info:abc123:scholar.google.com/&output=citation">BibTeX</a></div>'
+            if "output=cite" in url
+            else "@article{scholar2024survey, title={Large language models for time series: A survey}}"
+        )
+
+        citation = resolver.resolve(source)
+
+        self.assertIn("@article{scholar2024survey,", citation.bibtex)
+
+    def test_resolve_rejects_google_scholar_html_and_falls_back_to_web_bibtex(self) -> None:
+        resolver = self.make_resolver()
+        source = SourceDocument(
+            source_id="google_scholar:biollmbench",
+            title="Biollmbench: A comprehensive benchmarking of large language models in bioinformatics",
+            url="https://www.biorxiv.org/content/10.1101/2023.12.19.572483.abstract",
+            kind="paper",
+            backend="google_scholar",
+            authors=["V Sarwal"],
+            year="2023",
+            scholar_id="AzPyPP0GfhIJ",
+            scholar_cite_url="https://scholar.google.com/scholar?q=info%3AAzPyPP0GfhIJ%3Ascholar.google.com%2F&output=cite",
+        )
+        resolver._fetch_bibtex_for_doi = lambda doi: ""  # type: ignore[method-assign]
+        resolver._get_text = lambda url, headers=None: (  # type: ignore[method-assign]
+            '<div id="gs_citi"><a class="gs_citi" href="https://scholar.googleusercontent.com/scholar.bib?q=info:AzPyPP0GfhIJ:scholar.google.com/&output=citation">BibTeX</a></div>'
+            if "output=cite" in url
+            else "<!doctype html><html><head><title>Google Scholar</title></head><body>blocked</body></html>"
+        )
+
+        citation = resolver.resolve(source)
+
+        self.assertTrue(citation.bibtex.startswith("@misc{"))
+        self.assertIn("biorxiv.org", citation.bibtex)
+        self.assertNotIn("<!doctype html>", citation.bibtex.lower())
+
+    def test_is_valid_bibtex_rejects_html_documents(self) -> None:
+        self.assertFalse(
+            CitationResolver.is_valid_bibtex(
+                "<!doctype html><html><body>not bibtex</body></html>"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

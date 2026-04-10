@@ -60,6 +60,7 @@ class SearchToolkit:
             query_results: list[SearchResult] = []
             query_results.extend(self._search_arxiv(query))
             query_results.extend(self._search_semantic_scholar(query))
+            query_results.extend(self._search_google_scholar(query))
             query_results.extend(self._search_crossref(query))
             if self.settings.google_api_key and self.settings.google_cse_id:
                 query_results.extend(self._search_google_cse(query))
@@ -83,6 +84,8 @@ class SearchToolkit:
                 year=result.year,
                 doi=result.doi,
                 arxiv_id=result.arxiv_id,
+                scholar_id=result.scholar_id,
+                scholar_cite_url=result.scholar_cite_url,
                 abstract=result.abstract,
                 text=text,
                 text_chunks=self.select_chunk_sample(self.chunk_text(text)),
@@ -239,6 +242,16 @@ class SearchToolkit:
                 results.append(parsed)
         return results
 
+    def _search_google_scholar(self, query: str) -> list[SearchResult]:
+        if not self.settings.enable_google_scholar:
+            return []
+        results: list[SearchResult] = []
+        if self.settings.serpapi_api_key:
+            results.extend(self._search_serpapi_google_scholar(query))
+        if results:
+            return results
+        return self._search_google_scholar_html(query)
+
     def _promote_results(self, results: list[SearchResult]) -> list[SearchResult]:
         promoted: list[SearchResult] = []
         for result in results:
@@ -246,6 +259,46 @@ class SearchToolkit:
         return promoted
 
     def _promote_result(self, result: SearchResult) -> SearchResult:
+        if result.backend == "google_scholar":
+            arxiv_id = self._extract_arxiv_id(result.url) or self._extract_arxiv_id(
+                " ".join([result.title, result.snippet, result.abstract])
+            )
+            if arxiv_id:
+                promoted = SearchResult(
+                    result_id=f"arxiv:{arxiv_id}",
+                    title=self._clean_result_title(result.title),
+                    url=f"https://arxiv.org/abs/{arxiv_id}",
+                    snippet=result.snippet,
+                    backend="arxiv",
+                    kind="paper",
+                    authors=list(result.authors),
+                    year=result.year,
+                    doi=result.doi,
+                    arxiv_id=arxiv_id,
+                    abstract=result.abstract or result.snippet,
+                    citation_count=result.citation_count,
+                    matched_queries=list(result.matched_queries),
+                    scholar_id=result.scholar_id,
+                    scholar_cite_url=result.scholar_cite_url,
+                )
+                return self._merge_results(promoted, result)
+
+            doi = self._extract_doi(result.url) or self._extract_doi(
+                " ".join([result.title, result.snippet, result.abstract])
+            )
+            if doi:
+                promoted = self._crossref_result_for_doi(doi, result.matched_queries)
+                if promoted is not None:
+                    promoted.url = self._preferred_publisher_url(result.url, promoted.url, doi)
+                    return self._merge_results(promoted, result)
+
+            promoted = self._crossref_result_for_title(result.title, result.matched_queries)
+            if promoted is not None:
+                promoted.url = self._preferred_publisher_url(result.url, promoted.url, promoted.doi)
+                return self._merge_results(promoted, result)
+
+            return result
+
         if result.kind != "web":
             return result
 
@@ -363,6 +416,91 @@ class SearchToolkit:
             )
         return results
 
+    def _search_serpapi_google_scholar(self, query: str) -> list[SearchResult]:
+        endpoint = (
+            "https://serpapi.com/search.json?"
+            + parse.urlencode(
+                {
+                    "engine": "google_scholar",
+                    "q": query,
+                    "num": self.settings.max_paper_results_per_query,
+                    "hl": "en",
+                    "api_key": self.settings.serpapi_api_key,
+                }
+            )
+        )
+        payload = self._fetch_json(endpoint)
+        results: list[SearchResult] = []
+        for index, item in enumerate(payload.get("organic_results", []), start=1):
+            title = str(item.get("title", "") or "").strip()
+            if not title:
+                continue
+            publication_info = item.get("publication_info", {}) or {}
+            publication_summary = str(publication_info.get("summary", "") or "")
+            authors = [
+                str(author.get("name", "")).strip()
+                for author in publication_info.get("authors", []) or []
+                if str(author.get("name", "")).strip()
+            ]
+            if not authors:
+                authors = self._parse_scholar_authors(publication_summary)
+            inline_links = item.get("inline_links", {}) or {}
+            cited_by = inline_links.get("cited_by", {}) or {}
+            citation_count = int(cited_by.get("total", 0) or 0)
+            resources = item.get("resources", []) or []
+            resource_link = ""
+            for resource in resources:
+                candidate = str(resource.get("link", "") or "").strip()
+                if candidate:
+                    resource_link = candidate
+                    break
+            scholar_id = str(item.get("result_id", "") or "")
+            url = str(item.get("link", "") or "").strip() or resource_link
+            snippet = str(item.get("snippet", "") or "")
+            results.append(
+                SearchResult(
+                    result_id=f"google_scholar:{scholar_id or index}",
+                    title=title,
+                    url=url,
+                    snippet=snippet,
+                    backend="google_scholar",
+                    kind="paper",
+                    authors=authors,
+                    year=self._parse_scholar_year(publication_summary),
+                    doi=self._extract_doi(" ".join([url, snippet, publication_summary])),
+                    abstract=snippet,
+                    citation_count=citation_count,
+                    matched_queries=[query],
+                    scholar_id=scholar_id,
+                    scholar_cite_url=self._build_google_scholar_cite_url(
+                        scholar_id, rank=index - 1
+                    ),
+                )
+            )
+            if len(results) >= self.settings.max_paper_results_per_query:
+                break
+        return results
+
+    def _search_google_scholar_html(self, query: str) -> list[SearchResult]:
+        endpoint = (
+            "https://scholar.google.com/scholar?"
+            + parse.urlencode({"hl": "en", "as_sdt": "0,5", "q": query})
+        )
+        html = self._fetch_text(endpoint, headers=self._google_scholar_headers())
+        if not html or self._looks_like_google_scholar_challenge(html):
+            return []
+        results: list[SearchResult] = []
+        for index, block in enumerate(self._split_google_scholar_blocks(html), start=1):
+            parsed_result = self._parse_google_scholar_block(
+                block, query=query, rank=index
+            )
+            if parsed_result is None:
+                continue
+            results.append(parsed_result)
+            if len(results) >= self.settings.max_paper_results_per_query:
+                break
+        return results
+
     def _search_duckduckgo(self, query: str) -> list[SearchResult]:
         endpoint = (
             "https://duckduckgo.com/html/?"
@@ -424,6 +562,8 @@ class SearchToolkit:
             year=result.year,
             doi=result.doi,
             arxiv_id=result.arxiv_id,
+            scholar_id=result.scholar_id,
+            scholar_cite_url=result.scholar_cite_url,
             abstract=result.abstract,
             text=text,
             text_chunks=self.select_chunk_sample(self.chunk_text(text)),
@@ -455,6 +595,8 @@ class SearchToolkit:
             year=result.year,
             doi=result.doi,
             arxiv_id=result.arxiv_id,
+            scholar_id=result.scholar_id,
+            scholar_cite_url=result.scholar_cite_url,
             abstract=result.abstract,
             text=text,
             text_chunks=self.select_chunk_sample(self.chunk_text(text)),
@@ -477,18 +619,23 @@ class SearchToolkit:
             year=result.year,
             doi=result.doi,
             arxiv_id=result.arxiv_id,
+            scholar_id=result.scholar_id,
+            scholar_cite_url=result.scholar_cite_url,
             abstract=result.abstract,
             text=text,
             text_chunks=self.select_chunk_sample(self.chunk_text(text)),
         )
 
-    def _fetch_text(self, url: str) -> str:
+    def _fetch_text(self, url: str, headers: dict[str, str] | None = None) -> str:
+        req_headers = {
+            "User-Agent": self.settings.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9,*/*;q=0.8",
+        }
+        if headers:
+            req_headers.update(headers)
         req = request.Request(
             url,
-            headers={
-                "User-Agent": self.settings.user_agent,
-                "Accept": "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9,*/*;q=0.8",
-            },
+            headers=req_headers,
             method="GET",
         )
         try:
@@ -532,6 +679,152 @@ class SearchToolkit:
         params = parse.parse_qs(parsed.query)
         redirected = params.get("uddg", [])
         return redirected[0] if redirected else url
+
+    @staticmethod
+    def _google_scholar_headers() -> dict[str, str]:
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://scholar.google.com/",
+        }
+
+    @staticmethod
+    def _looks_like_google_scholar_challenge(html: str) -> bool:
+        lowered = html.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "unusual traffic",
+                "please show you're not a robot",
+                "/sorry/",
+                "recaptcha",
+            )
+        )
+
+    @staticmethod
+    def _split_google_scholar_blocks(html: str) -> list[str]:
+        blocks = re.split(r'(?=<div class="gs_r gs_or gs_scl")', html)
+        return [
+            block
+            for block in blocks
+            if block.startswith('<div class="gs_r gs_or gs_scl"')
+        ]
+
+    def _parse_google_scholar_block(
+        self,
+        block: str,
+        *,
+        query: str,
+        rank: int,
+    ) -> SearchResult | None:
+        scholar_id_match = re.search(r'data-cid="([^"]+)"', block)
+        scholar_id = scholar_id_match.group(1).strip() if scholar_id_match else ""
+
+        title_match = re.search(r'<h3 class="gs_rt"[^>]*>(.*?)</h3>', block, re.S)
+        if not title_match:
+            return None
+        title_html = title_match.group(1)
+        title_link_match = re.search(r'href="([^"]+)"', title_html)
+        title = self._clean_result_title(self._strip_tags(title_html))
+        if not title:
+            return None
+        url = (
+            self._absolute_google_scholar_url(title_link_match.group(1))
+            if title_link_match
+            else ""
+        )
+
+        snippet_match = re.search(r'<div class="gs_rs"[^>]*>(.*?)</div>', block, re.S)
+        snippet = self._strip_tags(snippet_match.group(1)) if snippet_match else ""
+        meta_match = re.search(r'<div class="gs_a"[^>]*>(.*?)</div>', block, re.S)
+        meta = self._strip_tags(meta_match.group(1)) if meta_match else ""
+
+        resource_link_match = re.search(
+            r'<div class="gs_or_ggsm"[^>]*>.*?<a[^>]*href="([^"]+)"',
+            block,
+            re.S,
+        )
+        if not url and resource_link_match:
+            url = self._absolute_google_scholar_url(resource_link_match.group(1))
+
+        citation_match = re.search(r'>Cited by\s+([0-9,]+)<', block, re.I)
+        citation_count = (
+            int(citation_match.group(1).replace(",", "")) if citation_match else 0
+        )
+
+        return SearchResult(
+            result_id=f"google_scholar:{scholar_id or rank}",
+            title=title,
+            url=url,
+            snippet=snippet,
+            backend="google_scholar",
+            kind="paper",
+            authors=self._parse_scholar_authors(meta),
+            year=self._parse_scholar_year(meta),
+            doi=self._extract_doi(" ".join([url, title, snippet, meta])),
+            abstract=snippet,
+            citation_count=citation_count,
+            matched_queries=[query],
+            scholar_id=scholar_id,
+            scholar_cite_url=self._build_google_scholar_cite_url(scholar_id, rank=rank - 1),
+        )
+
+    @staticmethod
+    def _absolute_google_scholar_url(url: str) -> str:
+        cleaned = unescape(url or "").strip()
+        if not cleaned:
+            return ""
+        return parse.urljoin("https://scholar.google.com", cleaned)
+
+    @staticmethod
+    def _build_google_scholar_cite_url(scholar_id: str, *, rank: int = 0) -> str:
+        if not scholar_id:
+            return ""
+        return "https://scholar.google.com/scholar?" + parse.urlencode(
+            {
+                "q": f"info:{scholar_id}:scholar.google.com/",
+                "output": "cite",
+                "scirp": max(0, rank),
+                "hl": "en",
+            }
+        )
+
+    @staticmethod
+    def _parse_scholar_year(value: str) -> str:
+        match = re.search(r"\b(?:19|20)\d{2}\b", value or "")
+        return match.group(0) if match else ""
+
+    @staticmethod
+    def _parse_scholar_authors(value: str) -> list[str]:
+        cleaned = (value or "").replace("…", "").strip()
+        if not cleaned:
+            return []
+        prefix = cleaned.split(" - ", 1)[0]
+        parts = [part.strip() for part in prefix.replace("&", ",").split(",")]
+        authors: list[str] = []
+        for part in parts:
+            lowered = part.lower()
+            if not part or lowered in {"et al.", "et al", "..."}:
+                continue
+            if any(
+                marker in lowered
+                for marker in (
+                    "arxiv",
+                    "journal",
+                    "conference",
+                    "proceedings",
+                    "preprint",
+                )
+            ):
+                continue
+            if re.search(r"\b(?:19|20)\d{2}\b", part):
+                continue
+            authors.append(part)
+        return authors
 
     @staticmethod
     def _strip_tags(value: str) -> str:
@@ -737,8 +1030,16 @@ class SearchToolkit:
     def _clean_result_title(title: str) -> str:
         cleaned = SearchToolkit._strip_tags(title)
         cleaned = re.sub(r"^\s*pdf\s+", "", cleaned, flags=re.I)
-        cleaned = re.sub(r"\s*\.\.\.\s*$", "", cleaned)
-        cleaned = re.sub(r"\s*[-|]\s*(github|wikipedia|arxiv\.org|nsf public access)\s*$", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"^\s*github\s*-\s*[^:]+:\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s+([:;,?.!])", r"\1", cleaned)
+        cleaned = re.sub(r"\s*\.\.\.\s*", " ", cleaned)
+        cleaned = re.sub(
+            r"\s*[-|]\s*(github|wikipedia|arxiv\.org|nsf public access|pubmed central|pmc)\s*$",
+            "",
+            cleaned,
+            flags=re.I,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned)
         return cleaned.strip()
 
     @staticmethod
@@ -769,8 +1070,10 @@ class SearchToolkit:
             key = SearchToolkit._result_key(result)
             if not key:
                 continue
-            title_key = SearchToolkit._title_key(result)
-            canonical_key = aliases.get(key) or (aliases.get(title_key) if title_key else None) or key
+            title_key = SearchToolkit._title_key(result) if result.kind == "paper" else ""
+            canonical_key = aliases.get(key) or (aliases.get(title_key) if title_key else None)
+            if canonical_key is None:
+                canonical_key = SearchToolkit._equivalent_title_key(result, deduped) or key
             existing = deduped.get(canonical_key)
             if existing is None:
                 deduped[canonical_key] = result
@@ -791,16 +1094,31 @@ class SearchToolkit:
             return f"doi:{result.doi.strip().lower()}"
         if result.arxiv_id:
             return f"arxiv:{result.arxiv_id.strip().lower()}"
-        title = SearchToolkit._title_key(result)
-        if title:
-            return title
+        if result.kind == "paper":
+            title = SearchToolkit._title_key(result)
+            if title:
+                return title
         url = result.url.strip().lower()
         return f"url:{url}" if url else ""
 
     @staticmethod
     def _title_key(result: SearchResult) -> str:
-        title = re.sub(r"[^a-z0-9]+", " ", result.title.lower()).strip()
+        title = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            SearchToolkit._clean_result_title(result.title).lower(),
+        ).strip()
         return f"title:{title}" if title else ""
+
+    @staticmethod
+    def _equivalent_title_key(
+        result: SearchResult,
+        deduped: dict[str, SearchResult],
+    ) -> str | None:
+        for canonical_key, existing in deduped.items():
+            if SearchToolkit._same_work_by_title(existing, result):
+                return canonical_key
+        return None
 
     @staticmethod
     def _merge_results(left: SearchResult, right: SearchResult) -> SearchResult:
@@ -816,6 +1134,21 @@ class SearchToolkit:
         )
         merged_queries = SearchToolkit._dedupe_strings(
             list(primary.matched_queries) + list(secondary.matched_queries)
+        )
+        critic_relevant = (
+            primary.critic_relevant
+            if primary.critic_relevant is not None
+            else secondary.critic_relevant
+        )
+        critic_reason = (
+            primary.critic_reason
+            if primary.critic_reason
+            else secondary.critic_reason
+        )
+        critic_query = (
+            primary.critic_query
+            if primary.critic_query
+            else secondary.critic_query
         )
         return SearchResult(
             result_id=primary.result_id,
@@ -843,6 +1176,11 @@ class SearchToolkit:
             ),
             citation_count=max(primary.citation_count, secondary.citation_count),
             matched_queries=merged_queries,
+            scholar_id=primary.scholar_id or secondary.scholar_id,
+            scholar_cite_url=primary.scholar_cite_url or secondary.scholar_cite_url,
+            critic_relevant=critic_relevant,
+            critic_reason=critic_reason,
+            critic_query=critic_query,
         )
 
     @staticmethod
@@ -859,10 +1197,47 @@ class SearchToolkit:
         return overlap >= 2 and SearchToolkit._title_match_score(left_title, right_title) >= 0.72
 
     @staticmethod
+    def _same_work_by_title(left: SearchResult, right: SearchResult) -> bool:
+        if left.doi and right.doi and left.doi.strip().lower() == right.doi.strip().lower():
+            return True
+        if left.arxiv_id and right.arxiv_id and left.arxiv_id.strip().lower() == right.arxiv_id.strip().lower():
+            return True
+        if left.kind != "paper" and right.kind != "paper":
+            return False
+
+        left_title = SearchToolkit._clean_result_title(left.title)
+        right_title = SearchToolkit._clean_result_title(right.title)
+        if not left_title or not right_title:
+            return False
+
+        left_terms = SearchToolkit._title_terms(left_title)
+        right_terms = SearchToolkit._title_terms(right_title)
+        if not left_terms or not right_terms:
+            return False
+
+        overlap = len(left_terms & right_terms)
+        minimum_overlap = max(4, min(len(left_terms), len(right_terms)) - 1)
+        if overlap < minimum_overlap:
+            return False
+
+        score = SearchToolkit._title_match_score(left_title, right_title)
+        if score >= 0.86:
+            return True
+
+        return (
+            overlap >= 5
+            and (
+                left_title.lower().startswith(right_title.lower())
+                or right_title.lower().startswith(left_title.lower())
+            )
+        )
+
+    @staticmethod
     def _result_quality_key(result: SearchResult) -> tuple[int, int, int, int, int]:
         backend_rank = {
             "semantic_scholar": 5,
             "arxiv": 4,
+            "google_scholar": 3,
             "crossref": 2,
             "google_cse": 1,
             "serpapi": 1,

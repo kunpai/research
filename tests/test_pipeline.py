@@ -55,6 +55,25 @@ class RoleAwareOllama:
         raise AssertionError(f"unexpected model call: {system[:120]}")
 
 
+class FallbackCriticOllama:
+    def __init__(self, batch_text: str, single_text: dict[str, str] | None = None) -> None:
+        self.batch_text = batch_text
+        self.single_text = single_text or {}
+
+    def chat_json(self, system: str, user: str, **_: object) -> dict:
+        raise OllamaError("response_format unsupported")
+
+    def chat_text(self, system: str, user: str, **_: object) -> str:
+        if "Return one line per candidate" in system:
+            return self.batch_text
+        if "Return exactly one tab-separated line" in system:
+            for result_id, payload in self.single_text.items():
+                if result_id in user:
+                    return payload
+            return ""
+        raise AssertionError(f"unexpected text call: {system[:120]}")
+
+
 class FakeSearch:
     def __init__(self, mapping: dict[str, list[SearchResult]]) -> None:
         self.mapping = mapping
@@ -542,6 +561,8 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("architecture", joined_queries)
         self.assertNotIn("simulation", joined_queries)
         self.assertTrue(any("bioinformatics" in query for query in plan.queries))
+        self.assertIn("bioinformatics code benchmark", joined_queries)
+        self.assertNotIn("find benchmarks practical", joined_queries)
 
     def test_select_results_enforces_diverse_mix(self) -> None:
         pipeline, tempdir = self.make_pipeline(
@@ -759,6 +780,388 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(results[1].critic_relevant)
         self.assertIn("LLM", results[1].critic_reason)
 
+    def test_select_results_excludes_critic_rejected_sources_from_diversity_fill(self) -> None:
+        pipeline, tempdir = self.make_pipeline(
+            max_selected_sources=2,
+            min_papers=2,
+            min_web_sources=0,
+            max_critic_results=3,
+        )
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = RoleAwareOllama(
+            {
+                "CriticAgent": {
+                    "judgments": [
+                        {
+                            "result_id": "rejected-paper",
+                            "relevant": False,
+                            "reason": "Generic medicine review, not bioinformatics code generation.",
+                        },
+                        {
+                            "result_id": "biocoder-paper",
+                            "relevant": True,
+                            "reason": "Direct benchmark for bioinformatics code generation.",
+                        },
+                    ]
+                }
+            }
+        )
+
+        plan = ResearchPlan(
+            queries=["AI for bioinformatics code"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Find benchmarks and systems for AI in bioinformatics code generation.",
+            must_cover=["bioinformatics", "code generation"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="rejected-paper",
+                title="Custom Large Language Models Improve Accuracy for Evidence-Based Medicine",
+                url="https://doi.org/10.1016/example-medicine",
+                snippet="Medical evidence retrieval with custom large language models.",
+                backend="crossref",
+                kind="paper",
+                year="2025",
+                doi="10.1016/example-medicine",
+                abstract="Clinical guidance retrieval with large language models.",
+                citation_count=200,
+                matched_queries=["AI for bioinformatics code"],
+            ),
+            SearchResult(
+                result_id="biocoder-paper",
+                title="BioCoder: A Benchmark for Bioinformatics Code Generation with Large Language Models",
+                url="https://arxiv.org/abs/2404.12345",
+                snippet="Benchmark for bioinformatics code generation.",
+                backend="arxiv",
+                kind="paper",
+                year="2024",
+                arxiv_id="2404.12345",
+                abstract="Introduces a benchmark for bioinformatics code generation and evaluates LLM systems.",
+                matched_queries=["AI for bioinformatics code"],
+            ),
+            SearchResult(
+                result_id="backup-paper",
+                title="Supporting Workflow Reproducibility by Linking Bioinformatics Tools across Papers and Executable Code",
+                url="https://example.org/reproducibility",
+                snippet="Workflow reproducibility for bioinformatics tools.",
+                backend="semantic_scholar",
+                kind="paper",
+                year="2026",
+                abstract="Links bioinformatics tools across papers and executable code.",
+                matched_queries=["AI for bioinformatics code"],
+            ),
+        ]
+
+        selected = pipeline.select_results("AI for bioinformatics code", plan, {}, results)
+
+        self.assertEqual(
+            [item.result_id for item in selected],
+            ["biocoder-paper", "backup-paper"],
+        )
+        self.assertNotIn("rejected-paper", [item.result_id for item in selected])
+
+    def test_select_results_uses_plain_text_critic_fallback_when_schema_fails(self) -> None:
+        pipeline, tempdir = self.make_pipeline(max_selected_sources=1, max_critic_results=2)
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = FallbackCriticOllama(
+            "generic-paper\tNO\tGeneric AI hardware paper, not LLM chip design.\n"
+            "llm-paper\tYES\tDirectly studies LLMs for hardware design generation.\n"
+        )
+
+        plan = ResearchPlan(
+            queries=["AI for hardware chip design"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="What work exists on using LLMs for hardware chip design?",
+            must_cover=["LLMs", "chip design"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="generic-paper",
+                title="Hardware-Software Co-Design for On-Chip Learning in AI Systems",
+                url="https://doi.org/10.1145/example-generic",
+                snippet="Hardware-software co-design for AI systems.",
+                backend="crossref",
+                kind="paper",
+                year="2023",
+                doi="10.1145/example-generic",
+                abstract="A highly cited paper on on-chip learning and AI hardware systems.",
+                citation_count=600,
+                matched_queries=["AI for hardware chip design"],
+            ),
+            SearchResult(
+                result_id="llm-paper",
+                title="C2HLSC: Leveraging Large Language Models to Bridge the Software-to-Hardware Design Gap",
+                url="https://arxiv.org/abs/2412.00214v2",
+                snippet="Large language models for hardware design generation.",
+                backend="arxiv",
+                kind="paper",
+                year="2024",
+                arxiv_id="2412.00214v2",
+                abstract="Uses LLMs to translate software descriptions into hardware design artifacts.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+        ]
+
+        selected = pipeline.select_results("AI for hardware chip design", plan, {}, results)
+
+        self.assertEqual([item.result_id for item in selected], ["llm-paper"])
+        self.assertFalse(results[0].critic_relevant)
+        self.assertTrue(results[1].critic_relevant)
+        self.assertIn("Directly studies", results[1].critic_reason)
+
+    def test_select_results_uses_single_item_critic_fallback_for_missing_batch_lines(self) -> None:
+        pipeline, tempdir = self.make_pipeline(max_selected_sources=1, max_critic_results=2)
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = FallbackCriticOllama(
+            "generic-paper\tNO\tStill generic.\n",
+            single_text={
+                "llm-paper": "YES\tDirectly studies LLMs for hardware design generation."
+            },
+        )
+
+        plan = ResearchPlan(
+            queries=["AI for hardware chip design"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="What work exists on using LLMs for hardware chip design?",
+            must_cover=["LLMs", "chip design"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="generic-paper",
+                title="Hardware-Software Co-Design for On-Chip Learning in AI Systems",
+                url="https://doi.org/10.1145/example-generic",
+                snippet="Hardware-software co-design for AI systems.",
+                backend="crossref",
+                kind="paper",
+                year="2023",
+                doi="10.1145/example-generic",
+                abstract="A highly cited paper on on-chip learning and AI hardware systems.",
+                citation_count=600,
+                matched_queries=["AI for hardware chip design"],
+            ),
+            SearchResult(
+                result_id="llm-paper",
+                title="C2HLSC: Leveraging Large Language Models to Bridge the Software-to-Hardware Design Gap",
+                url="https://arxiv.org/abs/2412.00214v2",
+                snippet="Large language models for hardware design generation.",
+                backend="arxiv",
+                kind="paper",
+                year="2024",
+                arxiv_id="2412.00214v2",
+                abstract="Uses LLMs to translate software descriptions into hardware design artifacts.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+        ]
+
+        selected = pipeline.select_results("AI for hardware chip design", plan, {}, results)
+
+        self.assertEqual([item.result_id for item in selected], ["llm-paper"])
+        self.assertTrue(results[1].critic_relevant)
+
+    def test_select_results_default_critic_judges_entire_shortlist(self) -> None:
+        pipeline, tempdir = self.make_pipeline(max_selected_sources=3)
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = RoleAwareOllama(
+            {
+                "CriticAgent": {
+                    "judgments": [
+                        {"result_id": "paper-a", "relevant": True, "reason": "Relevant."},
+                        {"result_id": "paper-b", "relevant": True, "reason": "Relevant."},
+                        {"result_id": "paper-c", "relevant": False, "reason": "Tangential."},
+                    ]
+                }
+            }
+        )
+
+        plan = ResearchPlan(
+            queries=["AI for hardware chip design"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Find work on LLMs for hardware chip design.",
+            must_cover=["LLMs", "chip design"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="paper-a",
+                title="Large Language Models for Chip Design Generation",
+                url="https://arxiv.org/abs/2501.00001",
+                snippet="LLMs for chip design generation.",
+                backend="arxiv",
+                kind="paper",
+                year="2025",
+                arxiv_id="2501.00001",
+                abstract="Uses LLMs to generate chip design artifacts.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+            SearchResult(
+                result_id="paper-b",
+                title="LLMs for Hardware Verification",
+                url="https://arxiv.org/abs/2501.00002",
+                snippet="LLMs for verification.",
+                backend="arxiv",
+                kind="paper",
+                year="2025",
+                arxiv_id="2501.00002",
+                abstract="Uses LLMs for hardware verification.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+            SearchResult(
+                result_id="paper-c",
+                title="General Hardware Co-Design Survey",
+                url="https://doi.org/10.1145/example-c",
+                snippet="Survey.",
+                backend="crossref",
+                kind="paper",
+                year="2024",
+                doi="10.1145/example-c",
+                abstract="Survey of hardware co-design.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+        ]
+
+        pipeline.select_results("AI for hardware chip design", plan, {}, results)
+
+        self.assertTrue(results[0].critic_relevant)
+        self.assertTrue(results[1].critic_relevant)
+        self.assertFalse(results[2].critic_relevant)
+
+    def test_select_results_falls_back_when_critic_rejects_every_candidate(self) -> None:
+        pipeline, tempdir = self.make_pipeline(max_selected_sources=1, max_critic_results=2)
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = RoleAwareOllama(
+            {
+                "CriticAgent": {
+                    "judgments": [
+                        {
+                            "result_id": "paper-a",
+                            "relevant": False,
+                            "reason": "Too generic.",
+                        },
+                        {
+                            "result_id": "paper-b",
+                            "relevant": False,
+                            "reason": "Too generic.",
+                        },
+                    ]
+                }
+            }
+        )
+
+        plan = ResearchPlan(
+            queries=["AI for hardware chip design"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Find work on LLMs for hardware chip design.",
+            must_cover=["LLMs", "chip design"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="paper-a",
+                title="Large Language Models for Chip Design Generation",
+                url="https://arxiv.org/abs/2501.00001",
+                snippet="LLMs for chip design generation.",
+                backend="arxiv",
+                kind="paper",
+                year="2025",
+                arxiv_id="2501.00001",
+                abstract="Uses LLMs to generate chip design artifacts.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+            SearchResult(
+                result_id="paper-b",
+                title="Hardware Co-Design Survey",
+                url="https://doi.org/10.1145/example-b",
+                snippet="Survey of hardware-software co-design.",
+                backend="crossref",
+                kind="paper",
+                year="2024",
+                doi="10.1145/example-b",
+                abstract="Survey of hardware-software co-design.",
+                matched_queries=["AI for hardware chip design"],
+            ),
+        ]
+
+        selected = pipeline.select_results("AI for hardware chip design", plan, {}, results)
+
+        self.assertEqual([item.result_id for item in selected], ["paper-a"])
+
+    def test_select_results_collapses_duplicate_source_variants(self) -> None:
+        pipeline, tempdir = self.make_pipeline(
+            max_selected_sources=3,
+            min_papers=2,
+            min_web_sources=0,
+        )
+        self.addCleanup(tempdir.cleanup)
+
+        plan = ResearchPlan(
+            queries=["AI for bioinformatics code"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Find benchmarks and systems for AI in bioinformatics code generation.",
+            must_cover=["bioinformatics", "code generation"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="biocoder-paper",
+                title="BioCoder: A Benchmark for Bioinformatics Code Generation with Large Language Models",
+                url="https://arxiv.org/abs/2308.16458v5",
+                snippet="Benchmark for bioinformatics code generation.",
+                backend="arxiv",
+                kind="paper",
+                year="2023",
+                arxiv_id="2308.16458v5",
+                doi="10.1093/bioinformatics/btae230",
+                abstract="Benchmark for bioinformatics code generation.",
+                matched_queries=["AI for bioinformatics code"],
+            ),
+            SearchResult(
+                result_id="biocoder-github",
+                title="GitHub - gersteinlab/BioCoder: BioCoder: A Benchmark for Bioinformatics ...",
+                url="https://github.com/gersteinlab/BioCoder",
+                snippet="Repository for the BioCoder benchmark.",
+                backend="duckduckgo",
+                kind="web",
+                matched_queries=["AI for bioinformatics code"],
+            ),
+            SearchResult(
+                result_id="biocoder-pmc",
+                title="BioCoder: a benchmark for bioinformatics code generation with large ...",
+                url="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC11211839/",
+                snippet="PMC mirror of the BioCoder article.",
+                backend="duckduckgo",
+                kind="web",
+                matched_queries=["AI for bioinformatics code"],
+            ),
+            SearchResult(
+                result_id="workflow-paper",
+                title="From Prompt to Pipeline: Large Language Models for Scientific Workflow",
+                url="https://arxiv.org/abs/2507.20122",
+                snippet="Scientific workflow generation with LLMs.",
+                backend="arxiv",
+                kind="paper",
+                year="2025",
+                arxiv_id="2507.20122",
+                abstract="Scientific workflow generation with LLMs.",
+                matched_queries=["AI for bioinformatics code"],
+            ),
+        ]
+
+        selected = pipeline.select_results("AI for bioinformatics code", plan, {}, results)
+
+        self.assertEqual(
+            [item.result_id for item in selected],
+            ["biocoder-paper", "workflow-paper"],
+        )
+
     def test_select_results_single_source_budget_skips_selector_model(self) -> None:
         pipeline, tempdir = self.make_pipeline(max_selected_sources=1)
         self.addCleanup(tempdir.cleanup)
@@ -866,6 +1269,52 @@ class PipelineTests(unittest.TestCase):
             ["paper-gem5", "paper-sfq"],
         )
         self.assertNotIn("repo", [item.result_id for item in selected])
+
+    def test_select_results_penalizes_results_missing_core_topic_terms(self) -> None:
+        pipeline, tempdir = self.make_pipeline(max_selected_sources=1)
+        self.addCleanup(tempdir.cleanup)
+        pipeline.ollama = FakeOllama({})
+
+        plan = ResearchPlan(
+            queries=["AI for bioinformatics code"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Find benchmarks and practical systems for AI in bioinformatics code generation.",
+            must_cover=["bioinformatics", "code generation"],
+            source_requirements=[],
+        )
+        results = [
+            SearchResult(
+                result_id="generic-ai",
+                title="Beyond principlism: Practical strategies for ethical AI use in research practices",
+                url="https://arxiv.org/abs/2402.00001",
+                snippet="Practical strategies for ethical AI use in research workflows and benchmarks.",
+                backend="arxiv",
+                kind="paper",
+                year="2024",
+                arxiv_id="2402.00001",
+                abstract="A practical discussion of AI use in research practices and benchmark culture.",
+                citation_count=200,
+                matched_queries=["AI for bioinformatics code"],
+            ),
+            SearchResult(
+                result_id="biocoder",
+                title="BioCoder: A Benchmark for Bioinformatics Code Generation with Large Language Models",
+                url="https://arxiv.org/abs/2404.12345",
+                snippet="Benchmark for bioinformatics code generation with LLMs.",
+                backend="arxiv",
+                kind="paper",
+                year="2024",
+                arxiv_id="2404.12345",
+                abstract="Introduces a benchmark for bioinformatics code generation and evaluates LLM systems.",
+                citation_count=10,
+                matched_queries=["AI for bioinformatics code"],
+            ),
+        ]
+
+        selected = pipeline.select_results("AI for bioinformatics code", plan, {}, results)
+
+        self.assertEqual([item.result_id for item in selected], ["biocoder"])
 
     def test_retrieve_results_expands_queries_from_facets_and_evidence(self) -> None:
         pipeline, tempdir = self.make_pipeline(
@@ -1714,6 +2163,66 @@ class PipelineTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("Chip Design \\& Chip Design for AI", references_text)
+
+    def test_write_outputs_filters_invalid_bibtex_entries(self) -> None:
+        pipeline, tempdir = self.make_pipeline(compile_latex=False)
+        self.addCleanup(tempdir.cleanup)
+
+        plan = ResearchPlan(
+            queries=["bioinformatics code"],
+            related_topics=[],
+            focus_areas=[],
+            rewritten_question="Summarize bioinformatics code generation.",
+            must_cover=[],
+            source_requirements=[],
+        )
+        synthesis = pipeline._coerce_synthesis_payload(
+            {
+                "title": "Bioinformatics Code",
+                "abstract": "Summary.",
+                "sections": [],
+                "findings": [],
+                "notes": [],
+                "delete_citation_keys": [],
+                "delete_finding_ids": [],
+            },
+            "Bioinformatics Code",
+        )
+        citations = [
+            CitationRecord(
+                cite_key="good2024",
+                bibtex="@article{good2024,\n  title = {Valid Paper},\n  year = {2024}\n}",
+                title="Valid Paper",
+                url="https://example.com/valid",
+                source_id="paper-1",
+            ),
+            CitationRecord(
+                cite_key="bad2024",
+                bibtex="<!doctype html><html><body>Google Scholar challenge</body></html>",
+                title="Bad Paper",
+                url="https://example.com/bad",
+                source_id="paper-2",
+            ),
+        ]
+
+        pipeline.write_outputs(
+            topic="Bioinformatics Code",
+            answers={},
+            plan=plan,
+            selected=[],
+            documents=[],
+            citations=citations,
+            source_notes=[],
+            synthesis=synthesis,
+            retrieval={},
+            collaboration=CollaborationSession(),
+        )
+
+        references_text = (
+            pipeline.output_dir / pipeline.settings.references_filename
+        ).read_text(encoding="utf-8")
+        self.assertIn("@article{good2024", references_text)
+        self.assertNotIn("<!doctype html>", references_text.lower())
 
     def test_render_report_strips_emoji_from_latex_text(self) -> None:
         pipeline, tempdir = self.make_pipeline(compile_latex=False)

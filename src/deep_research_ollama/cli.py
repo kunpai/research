@@ -268,7 +268,7 @@ def _add_knob_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-critic-results",
         type=int,
         default=None,
-        help="Maximum shortlist size passed to the critic.",
+        help="Maximum shortlist size passed to the critic. Use 0 to judge the full shortlist.",
     )
     parser.add_argument(
         "--max-chunks-per-source",

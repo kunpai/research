@@ -170,6 +170,60 @@ def relevance_critic_prompt(
     return system, user
 
 
+def relevance_critic_fallback_prompt(
+    topic: str,
+    rewritten_question: str,
+    answers: dict[str, str],
+    candidates: list[dict],
+    program: str,
+) -> tuple[str, str]:
+    system = _system_prompt(
+        program,
+        (
+            "You are CriticAgent. "
+            "Evaluate whether each candidate reference is substantively relevant to the query and research goal. "
+            "Use the provided query, title, and abstract or snippet. "
+            "Return YES only when the candidate clearly helps answer the question, not when it merely shares broad words. "
+            "Return NO for generic, tangential, or domain-mismatched matches. "
+            "Return one line per candidate in this exact tab-separated format and do not add any extra prose:\n"
+            "<result_id>\\tYES|NO\\t<short reason>"
+        ),
+    )
+    user = (
+        f"Topic: {topic}\n"
+        f"Rewritten question: {rewritten_question}\n"
+        f"Clarifications: {json.dumps(answers, ensure_ascii=True)}\n"
+        f"Candidates: {json.dumps(candidates, ensure_ascii=True)}"
+    )
+    return system, user
+
+
+def relevance_critic_single_fallback_prompt(
+    topic: str,
+    rewritten_question: str,
+    answers: dict[str, str],
+    candidate: dict,
+    program: str,
+) -> tuple[str, str]:
+    system = _system_prompt(
+        program,
+        (
+            "You are CriticAgent. "
+            "Evaluate whether the candidate reference is substantively relevant to the query and research goal. "
+            "Use the provided query, title, and abstract or snippet. "
+            "Return exactly one tab-separated line in this format and nothing else:\n"
+            "YES|NO\\t<short reason>"
+        ),
+    )
+    user = (
+        f"Topic: {topic}\n"
+        f"Rewritten question: {rewritten_question}\n"
+        f"Clarifications: {json.dumps(answers, ensure_ascii=True)}\n"
+        f"Candidate: {json.dumps(candidate, ensure_ascii=True)}"
+    )
+    return system, user
+
+
 def chunk_summary_prompt(
     topic: str,
     rewritten_question: str,

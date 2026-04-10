@@ -23,7 +23,10 @@ class CitationResolver:
         if not doi and not source.arxiv_id:
             doi = self._lookup_doi_by_title(source.title)
         if doi:
-            bibtex = self._fetch_bibtex_for_doi(doi)
+            bibtex = self._coerce_valid_bibtex(self._fetch_bibtex_for_doi(doi))
+
+        if not bibtex and (source.scholar_cite_url or source.scholar_id):
+            bibtex = self._fetch_bibtex_from_google_scholar(source)
 
         if not bibtex and source.arxiv_id:
             bibtex = self._build_arxiv_bibtex(source)
@@ -32,6 +35,8 @@ class CitationResolver:
             bibtex = self._build_web_bibtex(source)
 
         bibtex = self._normalize_bibtex(bibtex)
+        if not self.is_valid_bibtex(bibtex):
+            bibtex = self._normalize_bibtex(self._build_fallback_bibtex(source))
         cite_key = self._extract_cite_key(bibtex) or self._make_base_cite_key(source)
         cite_key = self._dedupe_cite_key(cite_key, existing_keys)
         bibtex = self._replace_cite_key(bibtex, cite_key)
@@ -98,6 +103,30 @@ class CitationResolver:
         except (error.URLError, json.JSONDecodeError):
             return {}
 
+    def _fetch_bibtex_from_google_scholar(self, source: SourceDocument) -> str:
+        cite_url = source.scholar_cite_url or self._build_google_scholar_cite_url(
+            source.scholar_id
+        )
+        if not cite_url:
+            return ""
+        cite_html = self._get_text(cite_url, headers=self._google_scholar_headers())
+        if not cite_html:
+            return ""
+        bibtex_match = re.search(
+            r'href="(https://scholar\.googleusercontent\.com/scholar\.bib[^"]+)"',
+            cite_html,
+            re.I,
+        )
+        if not bibtex_match:
+            return ""
+        bibtex_url = bibtex_match.group(1)
+        return self._coerce_valid_bibtex(
+            self._get_text(
+                bibtex_url,
+                headers=self._google_scholar_headers(),
+            )
+        )
+
     def _build_arxiv_bibtex(self, source: SourceDocument) -> str:
         key = self._make_base_cite_key(source)
         authors = " and ".join(source.authors) if source.authors else "Unknown"
@@ -127,6 +156,11 @@ class CitationResolver:
             "}"
         )
 
+    def _build_fallback_bibtex(self, source: SourceDocument) -> str:
+        if source.arxiv_id:
+            return self._build_arxiv_bibtex(source)
+        return self._build_web_bibtex(source)
+
     @staticmethod
     def _extract_cite_key(bibtex: str) -> str:
         match = re.match(r"@\w+\{([^,]+),", bibtex.strip())
@@ -140,6 +174,29 @@ class CitationResolver:
             bibtex,
             count=1,
         )
+
+    @classmethod
+    def _coerce_valid_bibtex(cls, bibtex: str) -> str:
+        candidate = bibtex.strip()
+        return candidate if cls.is_valid_bibtex(candidate) else ""
+
+    @staticmethod
+    def _looks_like_html_document(value: str) -> bool:
+        lowered = value.lstrip().lower()
+        return (
+            lowered.startswith("<!doctype html")
+            or lowered.startswith("<html")
+            or "<html" in lowered[:512]
+        )
+
+    @classmethod
+    def is_valid_bibtex(cls, bibtex: str) -> bool:
+        candidate = bibtex.strip()
+        if not candidate or cls._looks_like_html_document(candidate):
+            return False
+        if not re.match(r"^@\w+\s*\{\s*[^,\s][^,]*,", candidate):
+            return False
+        return "=" in candidate
 
     @classmethod
     def _normalize_bibtex(cls, bibtex: str) -> str:
@@ -228,6 +285,48 @@ class CitationResolver:
     @staticmethod
     def _escape_field(value: str) -> str:
         return value.replace("{", "\\{").replace("}", "\\}")
+
+    def _get_text(self, url: str, headers: dict[str, str] | None = None) -> str:
+        req_headers = {"User-Agent": self.settings.user_agent}
+        if headers:
+            req_headers.update(headers)
+        req = request.Request(
+            url,
+            headers=req_headers,
+            method="GET",
+        )
+        try:
+            with request.urlopen(
+                req, timeout=self.settings.request_timeout_seconds
+            ) as response:
+                return response.read().decode("utf-8", errors="ignore")
+        except error.URLError:
+            return ""
+
+    @staticmethod
+    def _google_scholar_headers() -> dict[str, str]:
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://scholar.google.com/",
+        }
+
+    @staticmethod
+    def _build_google_scholar_cite_url(scholar_id: str) -> str:
+        if not scholar_id:
+            return ""
+        return "https://scholar.google.com/scholar?" + parse.urlencode(
+            {
+                "q": f"info:{scholar_id}:scholar.google.com/",
+                "output": "cite",
+                "scirp": 0,
+                "hl": "en",
+            }
+        )
 
     @staticmethod
     def _title_match_score(expected: str, candidate: str) -> float:

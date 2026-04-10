@@ -412,6 +412,10 @@ class GuiApp:
         model = str(payload.get("model", "")).strip() or self.settings.llm_model
         api_base = str(payload.get("api_base", "")).strip() or default_api_base(provider)
         api_key = str(payload.get("api_key", "")).strip()
+        serpapi_api_key = str(payload.get("serpapi_api_key", "")).strip()
+        semantic_scholar_api_key = str(
+            payload.get("semantic_scholar_api_key", "")
+        ).strip()
         budget_value = payload.get("max_summary_model_calls", self.settings.max_summary_model_calls)
         try:
             max_summary_model_calls = max(1, int(budget_value))
@@ -439,7 +443,7 @@ class GuiApp:
                 payload.get("max_selected_sources"),
                 self.settings.max_selected_sources,
             ),
-            "max_critic_results": _coerce_positive_int(
+            "max_critic_results": _coerce_non_negative_int(
                 payload.get("max_critic_results"),
                 self.settings.max_critic_results,
             ),
@@ -472,6 +476,10 @@ class GuiApp:
         )
         env = os.environ.copy()
         env.update(provider_api_env_overrides(provider, api_key, api_base))
+        if serpapi_api_key:
+            env["SERPAPI_API_KEY"] = serpapi_api_key
+        if semantic_scholar_api_key:
+            env["SEMANTIC_SCHOLAR_API_KEY"] = semantic_scholar_api_key
         process = subprocess.Popen(
             command,
             cwd=str(self.launch_cwd),
@@ -991,6 +999,14 @@ class GuiApp:
           <label id="api-key-row"{" class=\"hidden\"" if not provider_info.get("requires_api_key") else ""}>{_escape_html(str(provider_info.get("api_key_label", "API Key")))}
             <input id="api-key" name="api_key" type="password" placeholder="Used only for the launched subprocess; never written to run artifacts.">
           </label>
+          <div class="knob-grid">
+            <label>SerpAPI Key
+              <input id="serpapi-api-key" name="serpapi_api_key" type="password" placeholder="Optional. Enables structured Google Scholar results.">
+            </label>
+            <label>Semantic Scholar Key
+              <input id="semantic-scholar-api-key" name="semantic_scholar_api_key" type="password" placeholder="Optional. Improves Semantic Scholar quota/reliability.">
+            </label>
+          </div>
           <label>Summary Budget
             <div class="inline" style="justify-content:space-between;">
               <span class="small">Max summary model calls</span>
@@ -1018,7 +1034,8 @@ class GuiApp:
               <input id="max-paper-results-per-query" name="max_paper_results_per_query" type="number" min="1" step="1" value="{default_max_paper_results}">
             </label>
             <label>Critic Shortlist
-              <input id="max-critic-results" name="max_critic_results" type="number" min="1" step="1" value="{default_max_critic_results}">
+              <input id="max-critic-results" name="max_critic_results" type="number" min="0" step="1" value="{default_max_critic_results}">
+              <span class="small">Use <code>0</code> to judge the full shortlist.</span>
             </label>
             <label>Chunks / Source
               <input id="max-chunks-per-source" name="max_chunks_per_source" type="number" min="1" step="1" value="{default_max_chunks_per_source}">
@@ -1151,6 +1168,8 @@ class GuiApp:
     const apiBaseInput = document.getElementById('api-base');
     const apiKeyRow = document.getElementById('api-key-row');
     const apiKeyInput = document.getElementById('api-key');
+    const serpApiKeyInput = document.getElementById('serpapi-api-key');
+    const semanticScholarApiKeyInput = document.getElementById('semantic-scholar-api-key');
     const budgetSlider = document.getElementById('max-summary-model-calls');
     const budgetSliderValue = document.getElementById('budget-slider-value');
     const maxQueriesInput = document.getElementById('max-queries');
@@ -1315,6 +1334,8 @@ class GuiApp:
             model: modelInput.value.trim(),
             api_base: apiBaseInput.value.trim(),
             api_key: apiKeyInput.value,
+            serpapi_api_key: serpApiKeyInput.value,
+            semantic_scholar_api_key: semanticScholarApiKeyInput.value,
             max_summary_model_calls: Number(budgetSlider.value),
             max_queries: Number(maxQueriesInput.value),
             max_total_queries: Number(maxTotalQueriesInput.value),
@@ -1508,6 +1529,14 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _coerce_non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _model_options_html(models: list[str], selected_model: str) -> str:
